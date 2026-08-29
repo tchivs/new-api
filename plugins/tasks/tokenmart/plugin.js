@@ -48,7 +48,7 @@ export const meta = {
     en: "Apimart Tokenmart Seedance text-to-video generation",
     zh: "Apimart Tokenmart Seedance 文生视频",
   },
-  version: "1.0.3",
+  version: "1.0.4",
   author: { name: "QuantumNous" },
   models: MODELS,
   fetchMode: "per_task",
@@ -175,6 +175,9 @@ function normalizedRequest(req, model) {
   output.resolution = normalizeResolution(resolutionValue);
   for (const key of ["ratio", "size", "generate_audio", "audio"]) {
     if (req[key] !== undefined && req[key] !== null && req[key] !== "") output[key] = req[key];
+  }
+  for (const key of ["content", "input", "image", "images", "input_image", "input_images", "input_reference", "video", "videos", "video_url", "input_video", "reference", "references"]) {
+    if (req[key] !== undefined) output[key] = req[key];
   }
   return output;
 }
