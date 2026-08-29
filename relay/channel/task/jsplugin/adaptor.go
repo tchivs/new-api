@@ -22,12 +22,12 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
-	kitdto "github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	kitdto "github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 )
@@ -74,9 +74,16 @@ var taskArtifactKeyPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._~-]{0,1
 const maxTaskArtifacts = 64
 
 type TaskAdaptor struct {
-	plugin         *pluginruntime.LoadedPlugin
-	info           *relaycommon.RelayInfo
-	submit         *requestDescriptor
+	plugin *pluginruntime.LoadedPlugin
+	info   *relaycommon.RelayInfo
+	submit *requestDescriptor
+	// submitMapped records the host-resolved upstream model in effect when
+	// a.submit was built. RelayTaskSubmit applies the channel model_mapping
+	// *after* ValidateRequestAndSetAction, which already built (and cached) the
+	// submit descriptor, so a stale cache would ship the unmapped model name to
+	// the vendor. Rebuild once when the mapped name differs.
+	submitMapped   string
+	submitRebuilt  bool
 	routeRequest   *pluginruntime.RouteRequestContext
 	requestHeaders map[string]string
 	files          []map[string]any
@@ -958,8 +965,15 @@ func validateTaskArtifacts(value any) ([]channel.TaskArtifact, error) {
 }
 
 func (a *TaskAdaptor) buildSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*requestDescriptor, error) {
+	mapped := info.UpstreamModelName
 	if a.submit != nil {
-		return a.submit, nil
+		if a.submitMapped == mapped || a.submitRebuilt {
+			return a.submit, nil
+		}
+		// The host applied model_mapping after the validation-time build;
+		// discard the unmapped descriptor and rebuild with the resolved name.
+		a.submitRebuilt = true
+		a.submit = nil
 	}
 	started := time.Now()
 	value, err := a.plugin.Engine.Call(c.Request.Context(), "buildSubmitRequest", a.submitContext(c, info))
@@ -1011,6 +1025,7 @@ func (a *TaskAdaptor) buildSubmit(c *gin.Context, info *relaycommon.RelayInfo) (
 		info.UpstreamModelName = descriptor.RewriteModel
 	}
 	a.submit = &descriptor
+	a.submitMapped = mapped
 	method := strings.ToUpper(strings.TrimSpace(descriptor.Method))
 	if method == "" {
 		method = http.MethodPost
