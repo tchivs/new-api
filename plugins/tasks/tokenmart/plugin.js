@@ -7,7 +7,17 @@ const MODEL_MAP = {
   "doubao-seedance-2.5": "dreamina-seedance-2-5-hc",
 };
 
+const MODEL_MAP_DF = {
+  "doubao-seedance-2.0": "dreamina-seedance-2-0-260128-df",
+  "doubao-seedance-2.0-fast": "dreamina-seedance-2-0-fast-260128-df",
+  "doubao-seedance-2.0-mini": "dreamina-seedance-2-0-mini-260615-df",
+  "doubao-seedance-2.0-face": "dreamina-seedance-2-0-260128-df",
+  "doubao-seedance-2.0-fast-face": "dreamina-seedance-2-0-fast-260128-df",
+  "doubao-seedance-2.5": "dreamina-seedance-2-5-260628-df",
+};
+
 const MODELS = Object.keys(MODEL_MAP);
+
 const REFERENCE_ERROR = "tokenmart v1 supports text-to-video only; reference image/video inputs are not supported";
 
 export const meta = {
@@ -19,7 +29,7 @@ export const meta = {
     en: "Apimart Tokenmart Seedance text-to-video generation",
     zh: "Apimart Tokenmart Seedance 文生视频",
   },
-  version: "1.0.0",
+  version: "1.0.1",
   author: { name: "QuantumNous" },
   models: MODELS,
   fetchMode: "per_task",
@@ -58,9 +68,11 @@ function isObject(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-function upstreamModel(model) {
+function upstreamModel(model, baseUrl) {
   const value = trimmed(model);
-  return MODEL_MAP[value] || value;
+  const host = trimmed(baseUrl).toLowerCase();
+  const mapping = host.includes("model.stratosnear.com") ? MODEL_MAP_DF : MODEL_MAP;
+  return mapping[value] || value;
 }
 
 function rejectReference(value) {
@@ -196,7 +208,7 @@ export const native = {
 
 export function buildSubmitRequest(ctx) {
   const req = isObject(ctx.requestBody) ? ctx.requestBody : {};
-  const request = normalizedRequest(req, upstreamModel(ctx.upstreamModel || ctx.model || req.model));
+  const request = normalizedRequest(req, upstreamModel(ctx.upstreamModel || ctx.model || req.model, ctx.baseUrl));
   const body = {
     model: request.model,
     content: [{ type: "text", text: request.prompt }],
