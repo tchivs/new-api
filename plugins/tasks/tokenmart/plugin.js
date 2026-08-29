@@ -16,7 +16,26 @@ const MODEL_MAP_DF = {
   "doubao-seedance-2.5": "dreamina-seedance-2-5-260628-df",
 };
 
+const MODEL_MAP_AIV = {
+  "doubao-seedance-2.0": "seedance-2.0",
+  "doubao-seedance-2.0-fast": "seedance-2.0-fast",
+  "doubao-seedance-2.0-mini": "seedance-2.0-mini",
+  "doubao-seedance-2.0-face": "seedance-2.0",
+  "doubao-seedance-2.0-fast-face": "seedance-2.0-fast",
+  "doubao-seedance-2.5": "seedance-2.5",
+};
+
 const MODELS = Object.keys(MODEL_MAP);
+function isAivideo(baseUrl) {
+  return trimmed(baseUrl).toLowerCase().includes("aivideoapi.ai");
+}
+
+function upstreamModel(model, baseUrl) {
+  const value = trimmed(model);
+  const host = trimmed(baseUrl).toLowerCase();
+  const mapping = host.includes("model.stratosnear.com") ? MODEL_MAP_DF : isAivideo(host) ? MODEL_MAP_AIV : MODEL_MAP;
+  return mapping[value] || value;
+}
 
 const REFERENCE_ERROR = "tokenmart v1 supports text-to-video only; reference image/video inputs are not supported";
 
@@ -29,7 +48,7 @@ export const meta = {
     en: "Apimart Tokenmart Seedance text-to-video generation",
     zh: "Apimart Tokenmart Seedance 文生视频",
   },
-  version: "1.0.1",
+  version: "1.0.2",
   author: { name: "QuantumNous" },
   models: MODELS,
   fetchMode: "per_task",
@@ -68,12 +87,6 @@ function isObject(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-function upstreamModel(model, baseUrl) {
-  const value = trimmed(model);
-  const host = trimmed(baseUrl).toLowerCase();
-  const mapping = host.includes("model.stratosnear.com") ? MODEL_MAP_DF : MODEL_MAP;
-  return mapping[value] || value;
-}
 
 function rejectReference(value) {
   if (value !== undefined && value !== null && value !== "" && (!Array.isArray(value) || value.length > 0)) throw new Error(REFERENCE_ERROR);
@@ -208,35 +221,55 @@ export const native = {
 
 export function buildSubmitRequest(ctx) {
   const req = isObject(ctx.requestBody) ? ctx.requestBody : {};
-  const request = normalizedRequest(req, upstreamModel(ctx.upstreamModel || ctx.model || req.model, ctx.baseUrl));
-  const body = {
-    model: request.model,
-    content: [{ type: "text", text: request.prompt }],
-    duration: request.duration,
-    resolution: request.resolution,
-    watermark: false,
-  };
-  for (const key of ["ratio", "size", "generate_audio", "audio"]) {
-    if (request[key] !== undefined) body[key] = request[key];
+  const clientModel = ctx.upstreamModel || ctx.model || req.model;
+  const request = normalizedRequest(req, clientModel);
+  const model = upstreamModel(clientModel, ctx.baseUrl);
+  const headers = { "Content-Type": "application/json", Accept: "application/json", Authorization: "Bearer " + ctx.apiKey };
+  if (isAivideo(ctx.baseUrl)) {
+    const input = {
+      model: model,
+      prompt: request.prompt,
+      duration: request.duration,
+      resolution: request.resolution,
+      size: request.size || request.ratio || "16:9",
+    };
+    for (const key of ["generate_audio", "audio", "seed", "negative_prompt", "watermark", "nsfw_check", "tools"])
+      if (request[key] !== undefined) input[key] = request[key];
+    return { url: ctx.baseUrl + "/v1/videos/generations", method: "POST", headers: headers, body: { input: input }, action: "text_to_video", rewriteModel: model };
   }
-  return {
-    url: ctx.baseUrl + "/v1/video/generate",
-    method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json", Authorization: "Bearer " + ctx.apiKey },
-    body: body,
-    action: "text_to_video",
-    rewriteModel: body.model,
-  };
+  const body = { model: model, content: [{ type: "text", text: request.prompt }], duration: request.duration, resolution: request.resolution, watermark: false };
+  for (const key of ["ratio", "size", "generate_audio", "audio"]) if (request[key] !== undefined) body[key] = request[key];
+  return { url: ctx.baseUrl + "/v1/video/generate", method: "POST", headers: headers, body: body, action: "text_to_video", rewriteModel: model };
 }
 
 function responseTask(body) {
   if (isObject(body) && isObject(body.task)) return body.task;
+  if (isObject(body) && isObject(body.data) && (body.data.status !== undefined || body.data.output !== undefined)) return body.data;
   return isObject(body) ? body : {};
+}
+
+function responseData(body) {
+  return isObject(body && body.data) ? body.data : {};
+}
+
+function videoURL(body) {
+  const payload = responseTask(body);
+  const output = isObject(payload.output) ? payload.output : payload;
+  const candidates = [output.video_url, output.videoUrl, output.url, payload.video_url, payload.videoUrl, payload.url];
+  for (const candidate of candidates) if (trimmed(candidate)) return trimmed(candidate);
+  if (Array.isArray(output.videos)) {
+    for (const video of output.videos) {
+      const url = typeof video === "string" ? video : isObject(video) ? video.video_url || video.videoUrl || video.url : "";
+      if (trimmed(url)) return trimmed(url);
+    }
+  }
+  return "";
 }
 
 function taskIdentifier(body) {
   const task = responseTask(body);
-  return trimmed(task.id || task.task_id || (isObject(body) && (body.id || body.task_id)));
+  const data = responseData(body);
+  return trimmed(task.id || task.task_id || data.taskId || data.task_id || data.id || (isObject(body) && (body.id || body.task_id || body.taskId)));
 }
 
 export function parseSubmitResponse(ctx, response) {
@@ -279,25 +312,20 @@ export function extractUsageOnComplete(task, result, body) {
   if (Object.keys(facts).length === 0) return null;
   return facts;
 }
-
 export function buildQueryRequest(ctx) {
-  return {
-    url: ctx.baseUrl + "/v1/video/tasks/" + encodeURIComponent(ctx.taskId),
-    method: "GET",
-    headers: { Accept: "application/json", Authorization: "Bearer " + ctx.apiKey },
-  };
+  const path = isAivideo(ctx.baseUrl) ? "/v1/tasks/" : "/v1/video/tasks/";
+  return { url: ctx.baseUrl + path + encodeURIComponent(ctx.taskId), method: "GET", headers: { Accept: "application/json", Authorization: "Bearer " + ctx.apiKey } };
 }
 
 export function parseTaskResult(ctx, body) {
   const task = responseTask(body);
   const status = trimmed(task.status || (isObject(body) && body.status)).toLowerCase();
-  const outputs = Array.isArray(task.outputs) ? task.outputs : Array.isArray(body && body.outputs) ? body.outputs : [];
-  let url = "";
-  for (const output of outputs) {
-    const candidate = typeof output === "string" ? output : isObject(output) ? output.url || output.video_url : "";
-    if (trimmed(candidate)) {
-      url = trimmed(candidate);
-      break;
+  let url = videoURL(body);
+  if (!url) {
+    const outputs = Array.isArray(task.outputs) ? task.outputs : Array.isArray(body && body.outputs) ? body.outputs : [];
+    for (const output of outputs) {
+      const candidate = typeof output === "string" ? output : isObject(output) ? output.url || output.video_url : "";
+      if (trimmed(candidate)) { url = trimmed(candidate); break; }
     }
   }
   if (status === "pending" || status === "queued") return { status: "QUEUED", progress: "10%" };
@@ -318,6 +346,8 @@ export function parseTaskResult(ctx, body) {
 }
 
 function artifactURL(data) {
+  const nested = videoURL(data);
+  if (nested) return nested;
   const task = responseTask(data);
   const outputs = Array.isArray(task.outputs) ? task.outputs : [];
   for (const output of outputs) {
@@ -326,7 +356,6 @@ function artifactURL(data) {
   }
   return "";
 }
-
 export function listArtifacts(task) {
   return task && task.status === "SUCCESS" && artifactURL(task.data) ? [{ key: "video", type: "video", mimeType: "video/mp4" }] : [];
 }
