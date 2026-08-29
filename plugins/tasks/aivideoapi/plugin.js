@@ -42,10 +42,6 @@ export const meta = {
     { label: "720p · 5s", facts: { seconds: 5, resolution: "720p", video_input: "none" } },
     { label: "1080p · 10s", facts: { seconds: 10, resolution: "1080p", video_input: "none" } },
   ],
-  routes: [
-    { method: "POST", path: "/v1/videos/generations", type: "submit", decode: "createTask", render: "taskCreated", models: MODELS },
-    { method: "GET", path: "/v1/tasks/:task_id", type: "query", render: "taskStatus" },
-  ],
   protocols: ["openai_video"],
   auth: "api_key",
 };
