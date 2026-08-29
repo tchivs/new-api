@@ -73,6 +73,12 @@ var taskArtifactKeyPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._~-]{0,1
 
 const maxTaskArtifacts = 64
 
+const (
+	maxPreflightRequests = 120
+	preflightTimeout     = 3 * time.Minute
+	preflightInterval    = 250 * time.Millisecond
+)
+
 type TaskAdaptor struct {
 	plugin *pluginruntime.LoadedPlugin
 	info   *relaycommon.RelayInfo
@@ -82,11 +88,13 @@ type TaskAdaptor struct {
 	// *after* ValidateRequestAndSetAction, which already built (and cached) the
 	// submit descriptor, so a stale cache would ship the unmapped model name to
 	// the vendor. Rebuild once when the mapped name differs.
-	submitMapped   string
-	submitRebuilt  bool
-	routeRequest   *pluginruntime.RouteRequestContext
-	requestHeaders map[string]string
-	files          []map[string]any
+	submitMapped     string
+	submitRebuilt    bool
+	routeRequest     *pluginruntime.RouteRequestContext
+	requestHeaders   map[string]string
+	files            []map[string]any
+	preflightDone    bool
+	preflightResults []any
 }
 
 func New(plugin *pluginruntime.LoadedPlugin) *TaskAdaptor { return &TaskAdaptor{plugin: plugin} }
@@ -221,16 +229,191 @@ func (a *TaskAdaptor) BuildRequestHeader(_ *gin.Context, req *http.Request, _ *r
 	}
 	return nil
 }
+func (a *TaskAdaptor) runPreflight(c *gin.Context, info *relaycommon.RelayInfo) error {
+	if a.preflightDone {
+		return nil
+	}
+	requestContext := context.Background()
+	if c != nil && c.Request != nil {
+		requestContext = c.Request.Context()
+	}
+	preflightContext, cancel := context.WithTimeout(requestContext, preflightTimeout)
+	defer cancel()
+	buildFound, err := a.plugin.Engine.HasCallablePath(preflightContext, "buildPreflightRequest")
+	if err != nil {
+		return fmt.Errorf("preflight hook inspection failed: %w", err)
+	}
+	parseFound, err := a.plugin.Engine.HasCallablePath(preflightContext, "parsePreflightResponse")
+	if err != nil {
+		return fmt.Errorf("preflight hook inspection failed: %w", err)
+	}
+	if !buildFound || !parseFound {
+		a.preflightDone = true
+		return nil
+	}
+
+	buildRequest := func() (any, error) {
+		value, callErr := a.plugin.Engine.Call(preflightContext, "buildPreflightRequest", a.submitContext(c, info))
+		if callErr != nil {
+			return nil, fmt.Errorf("preflight request hook failed: %w", callErr)
+		}
+		return value, nil
+	}
+	value, err := buildRequest()
+	if err != nil {
+		return err
+	}
+	for attempt := 0; attempt < maxPreflightRequests; attempt++ {
+		if value == nil {
+			a.preflightDone = true
+			// ValidateRequestAndSetAction may have built and cached the submit
+			// descriptor before this sequence. It must see the accumulated state.
+			a.submit = nil
+			a.submitMapped = ""
+			a.submitRebuilt = false
+			return nil
+		}
+		var descriptor requestDescriptor
+		if err := convert(value, &descriptor); err != nil {
+			return fmt.Errorf("preflight request hook returned an invalid descriptor: %w", err)
+		}
+		if strings.TrimSpace(descriptor.URL) == "" {
+			return fmt.Errorf("preflight request hook returned an empty URL")
+		}
+		if err := pluginruntime.ValidateRequestURL(descriptor.URL, info.ChannelBaseUrl, a.plugin.Meta.AllowedHosts); err != nil {
+			return fmt.Errorf("preflight request URL rejected: %w", err)
+		}
+		response, err := a.doPreflightRequest(preflightContext, c, descriptor, info)
+		if err != nil {
+			return fmt.Errorf("preflight request failed: %w", err)
+		}
+		responseValue, err := pluginResponseValue(response)
+		if err != nil {
+			return fmt.Errorf("preflight response failed: %w", err)
+		}
+		state, err := a.plugin.Engine.Call(preflightContext, "parsePreflightResponse", a.submitContext(c, info), responseValue)
+		if err != nil {
+			return fmt.Errorf("preflight response hook failed: %w", err)
+		}
+		state = jsonValue(state)
+		if _, err := common.Marshal(state); err != nil {
+			return fmt.Errorf("preflight response hook returned non-serializable state: %w", err)
+		}
+		a.preflightResults = append(a.preflightResults, state)
+
+		next, err := buildRequest()
+		if err != nil {
+			return err
+		}
+		if next == nil {
+			a.preflightDone = true
+			a.submit = nil
+			a.submitMapped = ""
+			a.submitRebuilt = false
+			return nil
+		}
+		if attempt == maxPreflightRequests-1 {
+			return fmt.Errorf("preflight exceeded maximum of %d requests", maxPreflightRequests)
+		}
+		wait := time.NewTimer(preflightInterval)
+		select {
+		case <-wait.C:
+		case <-preflightContext.Done():
+			if !wait.Stop() {
+				<-wait.C
+			}
+			return fmt.Errorf("preflight timed out: %w", preflightContext.Err())
+		}
+		value = next
+	}
+	return fmt.Errorf("preflight exceeded maximum of %d requests", maxPreflightRequests)
+}
+
+func (a *TaskAdaptor) doPreflightRequest(ctx context.Context, c *gin.Context, descriptor requestDescriptor, info *relaycommon.RelayInfo) (*http.Response, error) {
+	body, contentType, err := a.encodeDescriptorBody(c, &descriptor)
+	if err != nil {
+		return nil, fmt.Errorf("encode request body: %w", err)
+	}
+	method := strings.ToUpper(strings.TrimSpace(descriptor.Method))
+	if method == "" && c != nil && c.Request != nil {
+		method = strings.ToUpper(strings.TrimSpace(c.Request.Method))
+	}
+	if method == "" {
+		method = http.MethodPost
+	}
+	req, err := http.NewRequestWithContext(ctx, method, descriptor.URL, body)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	for name, value := range descriptor.Headers {
+		req.Header.Set(name, value)
+	}
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	client, err := service.GetHttpClientWithProxySettings(info.ChannelSetting.Proxy, info.ChannelSetting)
+	if err != nil {
+		return nil, fmt.Errorf("create proxy HTTP client: %w", err)
+	}
+	started := time.Now()
+	response, err := client.Do(req)
+	if err != nil {
+		logger.LogDebug(c, "task_plugin subsystem=adaptor event=preflight_request_failed plugin=%q method=%q reason=transport_error elapsed_ms=%d", a.plugin.Meta.Key, method, time.Since(started).Milliseconds())
+		return nil, err
+	}
+	logger.LogDebug(c, "task_plugin subsystem=adaptor event=preflight_response_received plugin=%q method=%q status=%d elapsed_ms=%d", a.plugin.Meta.Key, method, response.StatusCode, time.Since(started).Milliseconds())
+	return response, nil
+}
+
+func pluginResponseValue(response *http.Response) (map[string]any, error) {
+	if response == nil {
+		return nil, fmt.Errorf("response is nil")
+	}
+	var body []byte
+	var err error
+	if response.Body != nil {
+		body, err = io.ReadAll(response.Body)
+		closeErr := response.Body.Close()
+		if err == nil {
+			err = closeErr
+		}
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read response body: %w", err)
+	}
+	responseBody := any(string(body))
+	var decoded any
+	if common.Unmarshal(body, &decoded) == nil {
+		responseBody = decoded
+	}
+	headers := make(map[string][]string, len(response.Header))
+	maps.Copy(headers, response.Header)
+	return map[string]any{"statusCode": response.StatusCode, "headers": headers, "body": responseBody}, nil
+}
 
 func (a *TaskAdaptor) BuildRequestBody(c *gin.Context, info *relaycommon.RelayInfo) (io.Reader, error) {
+	if err := a.runPreflight(c, info); err != nil {
+		return nil, err
+	}
 	descriptor, err := a.buildSubmit(c, info)
 	if err != nil {
 		return nil, err
 	}
+	body, contentType, err := a.encodeDescriptorBody(c, descriptor)
+	if err != nil {
+		return nil, err
+	}
+	if contentType != "" {
+		c.Request.Header.Set("Content-Type", contentType)
+	}
+	return body, nil
+}
+
+func (a *TaskAdaptor) encodeDescriptorBody(c *gin.Context, descriptor *requestDescriptor) (io.Reader, string, error) {
 	if descriptor.BodyType == "multipart" {
 		form, parseErr := common.ParseMultipartFormReusable(c)
 		if parseErr != nil {
-			return nil, parseErr
+			return nil, "", parseErr
 		}
 		defer form.RemoveAll()
 		var body bytes.Buffer
@@ -240,26 +423,26 @@ func (a *TaskAdaptor) BuildRequestBody(c *gin.Context, info *relaycommon.RelayIn
 				header := make(textproto.MIMEHeader)
 				disposition := mime.FormatMediaType("form-data", map[string]string{"name": part.Name})
 				if disposition == "" {
-					return nil, fmt.Errorf("invalid multipart name")
+					return nil, "", fmt.Errorf("invalid multipart name")
 				}
 				header.Set("Content-Disposition", disposition)
 				destination, createErr := writer.CreatePart(header)
 				if createErr != nil {
-					return nil, createErr
+					return nil, "", createErr
 				}
-				if _, err = io.WriteString(destination, fmt.Sprint(part.Value)); err != nil {
-					return nil, err
+				if _, err := io.WriteString(destination, fmt.Sprint(part.Value)); err != nil {
+					return nil, "", err
 				}
 				continue
 			}
 			field := strings.TrimPrefix(part.FileRef, "request_file:")
 			files := form.File[field]
 			if len(files) == 0 {
-				return nil, fmt.Errorf("unknown file reference %q", part.FileRef)
+				return nil, "", fmt.Errorf("unknown file reference %q", part.FileRef)
 			}
 			file, openErr := files[0].Open()
 			if openErr != nil {
-				return nil, openErr
+				return nil, "", openErr
 			}
 			filename := part.Filename
 			if filename == "" {
@@ -269,7 +452,7 @@ func (a *TaskAdaptor) BuildRequestBody(c *gin.Context, info *relaycommon.RelayIn
 			disposition := mime.FormatMediaType("form-data", map[string]string{"name": part.Name, "filename": filename})
 			if disposition == "" {
 				file.Close()
-				return nil, fmt.Errorf("invalid multipart name or filename")
+				return nil, "", fmt.Errorf("invalid multipart name or filename")
 			}
 			header.Set("Content-Disposition", disposition)
 			header.Set("Content-Type", files[0].Header.Get("Content-Type"))
@@ -279,30 +462,29 @@ func (a *TaskAdaptor) BuildRequestBody(c *gin.Context, info *relaycommon.RelayIn
 			}
 			file.Close()
 			if copyErr != nil {
-				return nil, copyErr
+				return nil, "", copyErr
 			}
 		}
-		if err = writer.Close(); err != nil {
-			return nil, err
+		if err := writer.Close(); err != nil {
+			return nil, "", err
 		}
-		c.Request.Header.Set("Content-Type", writer.FormDataContentType())
-		return bytes.NewReader(body.Bytes()), nil
+		return bytes.NewReader(body.Bytes()), writer.FormDataContentType(), nil
 	}
 	if descriptor.Body == nil {
-		return nil, nil
+		return nil, "", nil
 	}
 	if text, ok := descriptor.Body.(string); ok {
-		return strings.NewReader(text), nil
+		return strings.NewReader(text), "", nil
 	}
 	inlined, err := inlineJSONFilePlaceholders(c, descriptor.Body)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	body, err := common.Marshal(inlined)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return bytes.NewReader(body), nil
+	return bytes.NewReader(body), "", nil
 }
 
 func maxInlineFileBytes() int64 {
@@ -1140,6 +1322,7 @@ func (a *TaskAdaptor) submitContext(c *gin.Context, info *relaycommon.RelayInfo)
 	ctx["upstreamModel"] = info.UpstreamModelName
 	ctx["baseUrl"] = info.ChannelBaseUrl
 	ctx["userSetting"] = info.UserSetting
+	ctx["preflightResults"] = append([]any(nil), a.preflightResults...)
 	proxy := ""
 	proxy = info.ChannelSetting.Proxy
 	if auth, err := resolveAuth(a.plugin.Meta.Auth, info.ApiKey, proxy); err == nil {

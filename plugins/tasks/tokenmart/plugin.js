@@ -48,7 +48,7 @@ export const meta = {
     en: "Apimart Tokenmart Seedance text-to-video generation",
     zh: "Apimart Tokenmart Seedance 文生视频",
   },
-  version: "1.0.2",
+  version: "1.0.3",
   author: { name: "QuantumNous" },
   models: MODELS,
   fetchMode: "per_task",
@@ -88,9 +88,6 @@ function isObject(value) {
 }
 
 
-function rejectReference(value) {
-  if (value !== undefined && value !== null && value !== "" && (!Array.isArray(value) || value.length > 0)) throw new Error(REFERENCE_ERROR);
-}
 
 function textFromContent(content) {
   if (!Array.isArray(content)) return "";
@@ -102,9 +99,9 @@ function textFromContent(content) {
     }
     if (!isObject(item)) continue;
     const type = trimmed(item.type).toLowerCase();
-    if (type && type !== "text" && type !== "input_text") throw new Error(REFERENCE_ERROR);
-    if (typeof item.text === "string" && trimmed(item.text)) texts.push(item.text);
-    if (item.image_url !== undefined || item.video_url !== undefined || item.input_reference !== undefined || item.url !== undefined) throw new Error(REFERENCE_ERROR);
+    if (type === "text" || type === "input_text" || !type) {
+      if (typeof item.text === "string" && trimmed(item.text)) texts.push(item.text);
+    }
   }
   return texts.join("\n");
 }
@@ -122,10 +119,7 @@ function textFromInput(input) {
       const type = trimmed(item.type).toLowerCase();
       if (type === "text" || type === "input_text") {
         if (typeof item.text === "string" && trimmed(item.text)) texts.push(item.text);
-      } else {
-        throw new Error(REFERENCE_ERROR);
       }
-      if (item.image_url !== undefined || item.video_url !== undefined || item.url !== undefined) throw new Error(REFERENCE_ERROR);
       continue;
     }
     if (Array.isArray(item.content)) texts.push(textFromContent(item.content));
@@ -133,14 +127,6 @@ function textFromInput(input) {
     else if (item.content !== undefined) throw new Error(REFERENCE_ERROR);
   }
   return texts.filter(function (text) { return trimmed(text); }).join("\n");
-}
-
-function rejectRequestReferences(req) {
-  if (!isObject(req)) return;
-  for (const key of ["image", "images", "input_image", "input_images", "input_reference", "video", "videos", "video_url", "input_video", "reference", "references"])
-    rejectReference(req[key]);
-  if (req.content !== undefined) textFromContent(req.content);
-  if (Array.isArray(req.input)) textFromInput(req.input);
 }
 
 function requestPrompt(req) {
@@ -180,7 +166,6 @@ function normalizeResolution(value) {
 
 function normalizedRequest(req, model) {
   if (!isObject(req)) throw new Error("request body must be an object");
-  rejectRequestReferences(req);
   const prompt = requestPrompt(req);
   if (!trimmed(prompt)) throw new Error("text prompt is required");
   const output = { model: model, prompt: prompt };
@@ -192,6 +177,78 @@ function normalizedRequest(req, model) {
     if (req[key] !== undefined && req[key] !== null && req[key] !== "") output[key] = req[key];
   }
   return output;
+}
+
+function collectReferences(req) {
+  const refs = [];
+  const seen = new Set();
+  const add = (url, kind) => {
+    const value = trimmed(url);
+    if (!value || value.toLowerCase().startsWith("asset://") || value.toLowerCase().startsWith("data:")) return;
+    const key = kind + "\0" + value;
+    if (!seen.has(key)) { seen.add(key); refs.push({ url: value, assetType: kind }); }
+  };
+  const walk = (value, hint) => {
+    if (typeof value === "string") {
+      if (hint && (hint.includes("image") || hint.includes("video") || hint === "url" || hint === "input_reference")) add(value, hint.includes("video") ? "Video" : "Image");
+      return;
+    }
+    if (Array.isArray(value)) { value.forEach((item) => walk(item, hint)); return; }
+    if (!isObject(value)) return;
+    for (const [key, item] of Object.entries(value)) {
+      const lower = key.toLowerCase();
+      if (lower === "image_url" || lower === "image" || lower === "input_image" || lower === "images") {
+        if (typeof item === "string") add(item, "Image");
+        else if (isObject(item)) add(item.url, "Image");
+      } else if (lower.includes("video") || lower === "input_reference") {
+        if (typeof item === "string") add(item, "Video");
+        else if (isObject(item)) add(item.url, "Video");
+      }
+      if (isObject(item) || Array.isArray(item)) walk(item, lower);
+    }
+  };
+  walk(req, "");
+  return refs;
+}
+
+function assetPath(baseUrl) {
+  const host = trimmed(baseUrl).toLowerCase();
+  if (host.includes("aivideoapi.ai")) return "/v1/seedance/assets";
+  if (host.includes("model.stratosnear.com")) return "/v1/sd-5/assets";
+  return "/v1/sd/assets";
+}
+
+function assetState(ctx) {
+  const refs = collectReferences(ctx.requestBody || {});
+  const results = Array.isArray(ctx.preflightResults) ? ctx.preflightResults : [];
+  const done = new Set(results.filter((item) => isObject(item) && item.state === "active").map((item) => item.assetType + "\0" + item.url));
+  const target = refs.find((item) => !done.has(item.assetType + "\0" + item.url));
+  return { refs, results, target };
+}
+
+export function buildPreflightRequest(ctx) {
+  const state = assetState(ctx);
+  if (!state.target) return null;
+  const previous = state.results[state.results.length - 1];
+  const base = ctx.baseUrl + assetPath(ctx.baseUrl);
+  if (previous && previous.state === "poll" && previous.url === state.target.url && previous.assetId) {
+    return { url: base + "/" + encodeURIComponent(previous.assetId), method: "GET", headers: { Accept: "application/json", Authorization: "Bearer " + ctx.apiKey } };
+  }
+  return { url: base, method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json", Authorization: "Bearer " + ctx.apiKey }, body: { url: state.target.url, name: "new-api-" + Date.now(), asset_type: state.target.assetType } };
+}
+
+export function parsePreflightResponse(ctx, response) {
+  const state = assetState(ctx);
+  const target = state.target;
+  const body = response && response.body;
+  const data = isObject(body && body.data) ? body.data : isObject(body) ? body : {};
+  const assetId = trimmed(data.id || data.asset_id || data.assetId);
+  const status = trimmed(data.status || body && body.status).toLowerCase();
+  if (!target) return { state: "active" };
+  if (assetId && status === "active" || assetId && status === "completed") return { state: "active", url: target.url, assetType: target.assetType, assetId: assetId };
+  if (!assetId && status === "failed") throw new Error("asset audit failed");
+  if (assetId) return { state: "poll", url: target.url, assetType: target.assetType, assetId: assetId };
+  throw new Error("asset audit response missing asset id");
 }
 
 export const native = {
@@ -219,12 +276,21 @@ export const native = {
   },
 };
 
+function resolvedReferences(req, results) {
+  const map = new Map();
+  for (const item of Array.isArray(results) ? results : []) {
+    if (isObject(item) && item.state === "active" && item.assetId && item.url) map.set(item.assetType + "\0" + item.url, "asset://" + item.assetId);
+  }
+  return collectReferences(req).map((item) => Object.assign({}, item, { value: map.get(item.assetType + "\0" + item.url) || item.url }));
+}
+
 export function buildSubmitRequest(ctx) {
   const req = isObject(ctx.requestBody) ? ctx.requestBody : {};
   const clientModel = ctx.upstreamModel || ctx.model || req.model;
   const request = normalizedRequest(req, clientModel);
   const model = upstreamModel(clientModel, ctx.baseUrl);
   const headers = { "Content-Type": "application/json", Accept: "application/json", Authorization: "Bearer " + ctx.apiKey };
+  const refs = resolvedReferences(req, ctx.preflightResults);
   if (isAivideo(ctx.baseUrl)) {
     const input = {
       model: model,
@@ -233,11 +299,19 @@ export function buildSubmitRequest(ctx) {
       resolution: request.resolution,
       size: request.size || request.ratio || "16:9",
     };
+    const imageRefs = refs.filter((item) => item.assetType === "Image").map((item) => ({ url: item.value }));
+    const videoRefs = refs.filter((item) => item.assetType === "Video").map((item) => item.value);
+    if (imageRefs.length) input.image_urls = imageRefs;
+    if (videoRefs.length) input.video_urls = videoRefs;
     for (const key of ["generate_audio", "audio", "seed", "negative_prompt", "watermark", "nsfw_check", "tools"])
       if (request[key] !== undefined) input[key] = request[key];
     return { url: ctx.baseUrl + "/v1/videos/generations", method: "POST", headers: headers, body: { input: input }, action: "text_to_video", rewriteModel: model };
   }
   const body = { model: model, content: [{ type: "text", text: request.prompt }], duration: request.duration, resolution: request.resolution, watermark: false };
+  for (const ref of refs) {
+    if (ref.assetType === "Video") body.content.push({ type: "video_url", video_url: { url: ref.value }, role: "reference_video" });
+    else body.content.push({ type: "image_url", image_url: { url: ref.value }, role: "reference_image" });
+  }
   for (const key of ["ratio", "size", "generate_audio", "audio"]) if (request[key] !== undefined) body[key] = request[key];
   return { url: ctx.baseUrl + "/v1/video/generate", method: "POST", headers: headers, body: body, action: "text_to_video", rewriteModel: model };
 }
@@ -377,7 +451,6 @@ export const protocols = {
         const body = Object.assign({}, ctx.body.value);
         const model = trimmed(ctx.model || body.model);
         if (!model) throw new Error("model is required");
-        rejectRequestReferences(body);
         const requestBody = normalizedRequest(body, model);
         return { kind: "submit", model: model, action: "text_to_video", requestBody: requestBody };
       }
@@ -393,7 +466,6 @@ export const protocols = {
         let metadata;
         try { metadata = JSON.parse(request.metadata); } catch (e) { throw new Error("metadata must be a JSON object string"); }
         if (!isObject(metadata)) throw new Error("metadata must be a JSON object string");
-        rejectRequestReferences(metadata);
         Object.assign(request, metadata);
       }
       const model = trimmed(ctx.model || request.model);
