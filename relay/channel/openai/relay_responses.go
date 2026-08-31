@@ -85,6 +85,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	imageCounter := &relaycommon.ImageGenerationCallCounter{}
 	imageCommitted := false
 	terminalEventSent := false
+	var streamErr *types.NewAPIError
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 
 		// 检查当前数据是否包含 completed 状态和 usage 信息
@@ -134,6 +135,15 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			}
 		case "response.failed", "response.incomplete", "response.cancelled", "response.canceled":
 			terminalEventSent = true
+			// Extract error from response.failed for retry logic.
+			// Upstream proxies (e.g. hicode.pro) may return rate_limit_exceeded
+			// as HTTP 200 + response.failed event, which bypasses normal retry.
+			if streamResponse.Response != nil {
+				if oaiErr := streamResponse.Response.GetOpenAIError(); oaiErr != nil && oaiErr.Message != "" {
+					streamErr = types.WithOpenAIError(*oaiErr, http.StatusTooManyRequests)
+					logger.LogError(c, "responses stream failed: "+oaiErr.Message)
+				}
+			}
 			if !imageCommitted {
 				imageCounter.Reset()
 				imageCounter.Commit(info)
@@ -201,6 +211,12 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	}
 
 	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+
+	// If upstream returned a response.failed event with a retriable error
+	// (e.g. rate_limit_exceeded), return it so relay.go can retry on another channel.
+	if streamErr != nil {
+		return usage, streamErr
+	}
 
 	return usage, nil
 }
