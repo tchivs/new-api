@@ -247,11 +247,15 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		newAPIError = service.NormalizeViolationFeeError(newAPIError)
 		relayInfo.LastError = newAPIError
 
-		processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError)
+	processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError)
 
-		if !shouldRetry(c, newAPIError, common.RetryTimes-retryParam.GetRetry()) {
-			break
-		}
+	if !shouldRetry(c, newAPIError, common.RetryTimes-retryParam.GetRetry()) {
+		break
+	}
+
+	// Clear channel affinity cache so retry picks a different channel
+	// instead of re-selecting the same failed one.
+	service.ClearCurrentChannelAffinityCache(c)
 	}
 
 	useChannel := c.GetStringSlice("use_channel")
