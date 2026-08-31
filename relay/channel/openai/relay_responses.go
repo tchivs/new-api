@@ -86,6 +86,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	imageCommitted := false
 	terminalEventSent := false
 	var streamErr *types.NewAPIError
+	dataForwarded := false // tracks whether any non-error event was sent to client
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 
 		// 检查当前数据是否包含 completed 状态和 usage 信息
@@ -95,7 +96,33 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			sr.Error(err)
 			return
 		}
+
+		// Intercept response.failed BEFORE forwarding to client.
+		// If no data has been forwarded yet, we can still retry to another channel.
+		// Once delta data is sent, the SSE response is committed and retry is impossible.
+		if streamResponse.Type == "response.failed" && !dataForwarded {
+			terminalEventSent = true
+			if streamResponse.Response != nil {
+				if oaiErr := streamResponse.Response.GetOpenAIError(); oaiErr != nil && oaiErr.Message != "" {
+					streamErr = types.WithOpenAIError(*oaiErr, http.StatusTooManyRequests)
+					logger.LogError(c, "responses stream failed (pre-forward): "+oaiErr.Message)
+				}
+			}
+			if !imageCommitted {
+				imageCounter.Reset()
+				imageCounter.Commit(info)
+				imageCommitted = true
+			}
+			sr.Error(fmt.Errorf("upstream response.failed: retriable"))
+			return
+		}
+
+		// Forward event to client
 		sendResponsesStreamData(c, streamResponse, data)
+		if streamResponse.Type != "response.failed" && streamResponse.Type != "response.incomplete" &&
+			streamResponse.Type != "response.cancelled" && streamResponse.Type != "response.canceled" {
+			dataForwarded = true
+		}
 		switch streamResponse.Type {
 		case "response.completed", "response.done":
 			terminalEventSent = true
@@ -135,13 +162,11 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			}
 		case "response.failed", "response.incomplete", "response.cancelled", "response.canceled":
 			terminalEventSent = true
-			// Extract error from response.failed for retry logic.
-			// Upstream proxies (e.g. hicode.pro) may return rate_limit_exceeded
-			// as HTTP 200 + response.failed event, which bypasses normal retry.
+			// Error event was already forwarded above. Extract error for billing.
 			if streamResponse.Response != nil {
 				if oaiErr := streamResponse.Response.GetOpenAIError(); oaiErr != nil && oaiErr.Message != "" {
 					streamErr = types.WithOpenAIError(*oaiErr, http.StatusTooManyRequests)
-					logger.LogError(c, "responses stream failed: "+oaiErr.Message)
+					logger.LogError(c, "responses stream failed (post-forward): "+oaiErr.Message)
 				}
 			}
 			if !imageCommitted {
@@ -213,8 +238,11 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 
 	// If upstream returned a response.failed event with a retriable error
-	// (e.g. rate_limit_exceeded), return it so relay.go can retry on another channel.
-	if streamErr != nil {
+	// (e.g. rate_limit_exceeded) AND no data was forwarded to the client,
+	// return the error so relay.go can retry on another channel.
+	// If data was already forwarded, the SSE response is committed and retry
+	// is impossible — return nil so the client sees the error event as-is.
+	if streamErr != nil && !dataForwarded {
 		return usage, streamErr
 	}
 
