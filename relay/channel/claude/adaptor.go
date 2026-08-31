@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -110,9 +109,13 @@ func CommonClaudeHeadersOperation(c *gin.Context, req *http.Header, info *relayc
 	anthropicBeta := c.Request.Header.Get("anthropic-beta")
 	if anthropicBeta != "" {
 		filtered := filterAnthropicBeta(anthropicBeta)
-		common.SysLog(fmt.Sprintf("CommonClaudeHeadersOperation: channel=%d model=%s beta_in=%q beta_out=%q", info.ChannelId, info.OriginModelName, anthropicBeta, filtered))
+		// Overwrite the original request header so any downstream code path
+		// (retries, pass-through, header overrides) sees the filtered value.
+		c.Request.Header.Set("anthropic-beta", filtered)
 		if filtered != "" {
 			req.Set("anthropic-beta", filtered)
+		} else {
+			req.Del("anthropic-beta")
 		}
 	}
 	model_setting.GetClaudeSettings().WriteHeaders(info.OriginModelName, req)
