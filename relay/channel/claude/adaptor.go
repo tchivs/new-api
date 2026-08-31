@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -27,10 +27,12 @@ func (a *Adaptor) ConvertGeminiRequest(*gin.Context, *relaycommon.RelayInfo, *dt
 }
 
 func (a *Adaptor) ConvertClaudeRequest(c *gin.Context, info *relaycommon.RelayInfo, request *dto.ClaudeRequest) (any, error) {
-	// Strip context_management: Bedrock proxies (hicode, etc.) return empty
-	// responses when this field is present. Native Anthropic endpoints ignore
-	// unknown fields, so stripping is harmless for them.
+	// Strip fields that Bedrock proxies (hicode, etc.) don't support.
+	// Native Anthropic endpoints ignore unknown fields, so stripping is harmless.
+	// - context_management: Bedrock returns empty responses
+	// - output_config: Bedrock rejects effort for models that don't support it
 	request.ContextManagement = nil
+	request.OutputConfig = nil
 	return request, nil
 }
 
@@ -107,13 +109,10 @@ func CommonClaudeHeadersOperation(c *gin.Context, req *http.Header, info *relayc
 	// common headers operation
 	anthropicBeta := c.Request.Header.Get("anthropic-beta")
 	if anthropicBeta != "" {
-		// Always filter known-Bedrock-unsupported beta flags. Bedrock proxies
-		// (hicode, etc.) reject these with 400 "invalid beta flag", breaking
-		// Claude Code. Filtering is harmless for native Anthropic endpoints
-		// since they simply ignore unrecognized flags.
-		anthropicBeta = filterAnthropicBeta(anthropicBeta)
-		if anthropicBeta != "" {
-			req.Set("anthropic-beta", anthropicBeta)
+		filtered := filterAnthropicBeta(anthropicBeta)
+		common.SysLog(fmt.Sprintf("CommonClaudeHeadersOperation: channel=%d model=%s beta_in=%q beta_out=%q", info.ChannelId, info.OriginModelName, anthropicBeta, filtered))
+		if filtered != "" {
+			req.Set("anthropic-beta", filtered)
 		}
 	}
 	model_setting.GetClaudeSettings().WriteHeaders(info.OriginModelName, req)
