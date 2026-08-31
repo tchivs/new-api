@@ -27,6 +27,10 @@ func (a *Adaptor) ConvertGeminiRequest(*gin.Context, *relaycommon.RelayInfo, *dt
 }
 
 func (a *Adaptor) ConvertClaudeRequest(c *gin.Context, info *relaycommon.RelayInfo, request *dto.ClaudeRequest) (any, error) {
+	// Strip context_management: Bedrock proxies (hicode, etc.) return empty
+	// responses when this field is present. Native Anthropic endpoints ignore
+	// unknown fields, so stripping is harmless for them.
+	request.ContextManagement = nil
 	return request, nil
 }
 
