@@ -26,12 +26,14 @@ func (a *Adaptor) ConvertGeminiRequest(*gin.Context, *relaycommon.RelayInfo, *dt
 }
 
 func (a *Adaptor) ConvertClaudeRequest(c *gin.Context, info *relaycommon.RelayInfo, request *dto.ClaudeRequest) (any, error) {
-	// Strip fields that Bedrock proxies (hicode, etc.) don't support.
-	// Native Anthropic endpoints ignore unknown fields, so stripping is harmless.
-	// - context_management: Bedrock returns empty responses
-	// - output_config: Bedrock rejects effort for models that don't support it
+	// Strip context_management: Bedrock proxies return empty responses when
+	// this field is present. Native Anthropic endpoints ignore unknown fields.
 	request.ContextManagement = nil
-	request.OutputConfig = nil
+	// Strip output_config only for models that don't support reasoning effort.
+	// Bedrock haiku-4.5 rejects output_config.effort with 400.
+	if strings.Contains(request.Model, "haiku") {
+		request.OutputConfig = nil
+	}
 	return request, nil
 }
 
