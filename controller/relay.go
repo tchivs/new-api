@@ -188,6 +188,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	if relayFormat == types.RelayFormatClaude {
 		if beta := c.Request.Header.Get("anthropic-beta"); beta != "" {
 			filtered := filterBedrockBeta(beta)
+			common.SysLog(fmt.Sprintf("EarlyBetaFilter: model=%s beta_in=%q beta_out=%q", relayInfo.OriginModelName, beta, filtered))
 			c.Request.Header.Set("anthropic-beta", filtered)
 		}
 	}
