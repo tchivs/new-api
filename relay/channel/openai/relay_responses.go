@@ -84,7 +84,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	var responseTextBuilder strings.Builder
 	imageCounter := &relaycommon.ImageGenerationCallCounter{}
 	imageCommitted := false
-
+	terminalEventSent := false
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 
 		// 检查当前数据是否包含 completed 状态和 usage 信息
@@ -97,6 +97,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		sendResponsesStreamData(c, streamResponse, data)
 		switch streamResponse.Type {
 		case "response.completed", "response.done":
+			terminalEventSent = true
 			if streamResponse.Response != nil {
 				if streamResponse.Response.Usage != nil {
 					if streamResponse.Response.Usage.InputTokens != 0 {
@@ -132,6 +133,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 				imageCommitted = true
 			}
 		case "response.failed", "response.incomplete", "response.cancelled", "response.canceled":
+			terminalEventSent = true
 			if !imageCommitted {
 				imageCounter.Reset()
 				imageCounter.Commit(info)
@@ -158,6 +160,32 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		}
 	})
 
+	// If the upstream closed the stream without a terminal event (response.completed/done/failed),
+	// synthesize one so the client doesn't see an abrupt stream close.
+	// This fixes "stream closed before a terminal response event was received" errors.
+	if !terminalEventSent {
+		logger.LogWarn(c, "upstream stream ended without terminal event, synthesizing response.completed")
+		if usage.CompletionTokens == 0 {
+			tempStr := responseTextBuilder.String()
+			if len(tempStr) > 0 {
+				usage.CompletionTokens = service.CountTextToken(tempStr, info.UpstreamModelName)
+			}
+		}
+		if usage.PromptTokens == 0 && usage.CompletionTokens != 0 {
+			usage.PromptTokens = info.GetEstimatePromptTokens()
+		}
+		usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+		syntheticData := fmt.Sprintf(`{"type":"response.completed","response":{"id":"%s","status":"completed","model":"%s","usage":{"input_tokens":%d,"output_tokens":%d,"total_tokens":%d}}}`,
+			helper.GetResponseID(c), info.UpstreamModelName, usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens)
+		_ = helper.ResponseChunkData(c, dto.ResponsesStreamResponse{Type: "response.completed"}, syntheticData)
+		_ = helper.StringData(c, "[DONE]")
+		_ = helper.FlushWriter(c)
+		if !imageCommitted {
+			imageCounter.Commit(info)
+			imageCommitted = true
+		}
+		return usage, nil
+	}
 	if usage.CompletionTokens == 0 {
 		// 计算输出文本的 token 数量
 		tempStr := responseTextBuilder.String()
