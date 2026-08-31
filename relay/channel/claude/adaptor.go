@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -71,11 +72,45 @@ func shouldAppendClaudeBetaQuery(info *relaycommon.RelayInfo) bool {
 	return false
 }
 
+// bedrockUnsupportedBetaFlags lists anthropic-beta tokens that AWS Bedrock
+// rejects with "invalid beta flag". When a channel is flagged as Bedrock-backed
+// (ChannelOtherSettings.StripUnsupportedBeta), these are filtered out so
+// Claude Code and other clients that send the full beta list can still work.
+var bedrockUnsupportedBetaFlags = map[string]bool{
+	"prompt-caching-scope-2026-01-05": true,
+	"advisor-tool-2026-03-01":         true,
+}
+
+func filterAnthropicBeta(beta string) string {
+	if beta == "" {
+		return ""
+	}
+	parts := strings.Split(beta, ",")
+	filtered := parts[:0]
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if !bedrockUnsupportedBetaFlags[p] {
+			filtered = append(filtered, p)
+		}
+	}
+	return strings.Join(filtered, ",")
+}
+
 func CommonClaudeHeadersOperation(c *gin.Context, req *http.Header, info *relaycommon.RelayInfo) {
 	// common headers operation
 	anthropicBeta := c.Request.Header.Get("anthropic-beta")
 	if anthropicBeta != "" {
-		req.Set("anthropic-beta", anthropicBeta)
+		// Always filter known-Bedrock-unsupported beta flags. Bedrock proxies
+		// (hicode, etc.) reject these with 400 "invalid beta flag", breaking
+		// Claude Code. Filtering is harmless for native Anthropic endpoints
+		// since they simply ignore unrecognized flags.
+		anthropicBeta = filterAnthropicBeta(anthropicBeta)
+		if anthropicBeta != "" {
+			req.Set("anthropic-beta", anthropicBeta)
+		}
 	}
 	model_setting.GetClaudeSettings().WriteHeaders(info.OriginModelName, req)
 }
