@@ -183,6 +183,16 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 	}()
 
+	// Early filter: remove Bedrock-unsupported anthropic-beta flags before any
+	// adaptor or retry runs. This ensures all code paths see the filtered header.
+	if relayFormat == types.RelayFormatClaude {
+		if beta := c.Request.Header.Get("anthropic-beta"); beta != "" {
+			filtered := filterBedrockBeta(beta)
+			c.Request.Header.Set("anthropic-beta", filtered)
+		}
+	}
+
+
 	retryParam := &service.RetryParam{
 		Ctx:         c,
 		TokenGroup:  relayInfo.TokenGroup,
@@ -872,4 +882,25 @@ func shouldRetryTaskRelay(c *gin.Context, channelId int, taskErr *taskdto.TaskEr
 		return false
 	}
 	return true
+}
+
+// filterBedrockBeta removes anthropic-beta tokens that AWS Bedrock rejects.
+var bedrockUnsupportedBetaFlags = map[string]bool{
+	"prompt-caching-scope-2026-01-05": true,
+	"advisor-tool-2026-03-01":         true,
+}
+
+func filterBedrockBeta(beta string) string {
+	parts := strings.Split(beta, ",")
+	filtered := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if !bedrockUnsupportedBetaFlags[p] {
+			filtered = append(filtered, p)
+		}
+	}
+	return strings.Join(filtered, ",")
 }
