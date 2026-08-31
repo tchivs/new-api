@@ -77,39 +77,54 @@ func shouldAppendClaudeBetaQuery(info *relaycommon.RelayInfo) bool {
 	return false
 }
 
-// bedrockUnsupportedBetaFlags lists anthropic-beta tokens that AWS Bedrock
-// rejects with "invalid beta flag". When a channel is flagged as Bedrock-backed
-// (ChannelOtherSettings.StripUnsupportedBeta), these are filtered out so
-// Claude Code and other clients that send the full beta list can still work.
-var bedrockUnsupportedBetaFlags = map[string]bool{
-	"prompt-caching-scope-2026-01-05": true,
-	"advisor-tool-2026-03-01":         true,
-	"advanced-tool-use-2025-11-20":    true,
+// bedrockSupportedBetaFlags lists anthropic-beta tokens that AWS Bedrock
+// is known to accept. When a channel has StripUnsupportedBeta enabled,
+// only these flags pass through; everything else is stripped so new
+// Claude CLI beta flags don't cause Bedrock 400 errors.
+var bedrockSupportedBetaFlags = map[string]bool{
+	"prompt-caching-2024-07-31":     true,
+	"output-128k-2025-02-19":        true,
+	"token-efficient-tools-2025-02-19": true,
+	"interleaved-thinking-2025-05-14": true,
+	"code-execution-2025-05-22":     true,
+	"files-api-2025-04-14":          true,
+	"pdfs-2024-09-25":               true,
+	"max-tokens-3-5-sonnet-2024-07-15": true,
 }
 
-func filterAnthropicBeta(beta string) string {
+// filterAnthropicBetaByWhitelist keeps only beta flags present in the allow list.
+func filterAnthropicBetaByWhitelist(beta string, allowed map[string]bool) string {
 	if beta == "" {
 		return ""
 	}
 	parts := strings.Split(beta, ",")
-	filtered := parts[:0]
+	filtered := make([]string, 0, len(parts))
 	for _, p := range parts {
 		p = strings.TrimSpace(p)
 		if p == "" {
 			continue
 		}
-		if !bedrockUnsupportedBetaFlags[p] {
+		if allowed[p] {
 			filtered = append(filtered, p)
 		}
 	}
 	return strings.Join(filtered, ",")
 }
 
+
 func CommonClaudeHeadersOperation(c *gin.Context, req *http.Header, info *relaycommon.RelayInfo) {
 	// common headers operation
 	anthropicBeta := c.Request.Header.Get("anthropic-beta")
 	if anthropicBeta != "" {
-		filtered := filterAnthropicBeta(anthropicBeta)
+		var filtered string
+		if info != nil && info.ChannelOtherSettings.StripUnsupportedBeta {
+			// Whitelist mode: only keep Bedrock-supported flags.
+			// New Claude CLI beta flags are stripped by default.
+			filtered = filterAnthropicBetaByWhitelist(anthropicBeta, bedrockSupportedBetaFlags)
+		} else {
+			// Pass-through mode: no filtering for non-Bedrock channels.
+			filtered = anthropicBeta
+		}
 		// Overwrite the original request header so any downstream code path
 		// (retries, pass-through, header overrides) sees the filtered value.
 		c.Request.Header.Set("anthropic-beta", filtered)
