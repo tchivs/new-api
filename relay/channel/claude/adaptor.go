@@ -81,15 +81,16 @@ func shouldAppendClaudeBetaQuery(info *relaycommon.RelayInfo) bool {
 // is known to accept. When a channel has StripUnsupportedBeta enabled,
 // only these flags pass through; everything else is stripped so new
 // Claude CLI beta flags don't cause Bedrock 400 errors.
+// bedrockSupportedBetaFlags lists anthropic-beta tokens that AWS Bedrock
+// is known to accept (verified against hicode Bedrock, 2026-08-31).
+// When a channel has StripUnsupportedBeta enabled, only these flags pass
+// through; everything else is stripped so new Claude CLI beta flags don't
+// cause Bedrock 400 errors.
 var bedrockSupportedBetaFlags = map[string]bool{
-	"prompt-caching-2024-07-31":     true,
 	"output-128k-2025-02-19":        true,
 	"token-efficient-tools-2025-02-19": true,
 	"interleaved-thinking-2025-05-14": true,
-	"code-execution-2025-05-22":     true,
-	"files-api-2025-04-14":          true,
 	"pdfs-2024-09-25":               true,
-	"max-tokens-3-5-sonnet-2024-07-15": true,
 }
 
 // filterAnthropicBetaByWhitelist keeps only beta flags present in the allow list.
