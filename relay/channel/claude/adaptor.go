@@ -84,6 +84,7 @@ func shouldAppendClaudeBetaQuery(info *relaycommon.RelayInfo) bool {
 var bedrockUnsupportedBetaFlags = map[string]bool{
 	"prompt-caching-scope-2026-01-05": true,
 	"advisor-tool-2026-03-01":         true,
+	"advanced-tool-use-2025-11-20":    true,
 }
 
 func filterAnthropicBeta(beta string) string {
