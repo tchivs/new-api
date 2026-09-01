@@ -51,6 +51,10 @@ func formatRequest(requestBody io.Reader, requestHeader http.Header) (*AwsClaude
 			}
 			awsClaudeRequest.AnthropicBeta = betaJson
 		}
+	} else {
+		// Header has no anthropic-beta (possibly filtered out by whitelist).
+		// Clear body's AnthropicBeta to prevent unsupported flags leaking through.
+		awsClaudeRequest.AnthropicBeta = nil
 	}
 	logger.LogJson(context.Background(), "json", awsClaudeRequest)
 	return &awsClaudeRequest, nil

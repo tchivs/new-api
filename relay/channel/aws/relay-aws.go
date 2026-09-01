@@ -192,7 +192,12 @@ func buildAwsRequestBody(c *gin.Context, info *relaycommon.RelayInfo, awsClaudeR
 		}
 		delete(data, "model")
 		delete(data, "stream")
-		return common.Marshal(data)
+		// Also strip anthropic_beta from body when beta header was filtered.
+		// Bedrock reads anthropic_beta from the body and converts it to the
+		// anthropic-beta header; unsupported flags cause 400 ValidationException.
+		if info.ChannelOtherSettings.StripUnsupportedBeta {
+			delete(data, "anthropic_beta")
+		}
 	}
 	return common.Marshal(awsClaudeReq)
 }
