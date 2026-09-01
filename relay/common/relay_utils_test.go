@@ -56,6 +56,12 @@ func TestSanitizeURLForLogKeepsURLWithoutSensitiveQuery(t *testing.T) {
 	assert.Equal(t, rawURL, got)
 }
 
+func TestFilterBedrockAnthropicBeta(t *testing.T) {
+	input := "advanced-tool-use-2025-11-20, interleaved-thinking-2025-05-14, prompt-caching-scope-2026-01-05, interleaved-thinking-2025-05-14"
+
+	assert.Equal(t, "interleaved-thinking-2025-05-14", FilterBedrockAnthropicBeta(input))
+	assert.Empty(t, FilterBedrockAnthropicBeta("advanced-tool-use-2025-11-20,prompt-caching-scope-2026-01-05"))
+}
 func TestValidateMultipartDirectNormalizesImageField(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	body := strings.NewReader(`{"model":"wan2.7-i2v","prompt":"animate","image":" https://example.com/first.png "}`)

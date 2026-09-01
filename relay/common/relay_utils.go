@@ -98,6 +98,37 @@ func isSensitiveURLQueryKey(key string) bool {
 		strings.Contains(normalized, "signature")
 }
 
+var bedrockAnthropicBetaSupported = map[string]struct{}{
+	"output-128k-2025-02-19":           {},
+	"token-efficient-tools-2025-02-19": {},
+	"interleaved-thinking-2025-05-14":  {},
+	"pdfs-2024-09-25":                  {},
+}
+
+// FilterBedrockAnthropicBeta keeps only beta flags accepted by Bedrock.
+// It is intentionally reusable by the final outbound-header path so runtime
+// header overrides cannot reintroduce flags filtered earlier in the relay.
+func FilterBedrockAnthropicBeta(beta string) string {
+	parts := strings.Split(beta, ",")
+	filtered := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, part := range parts {
+		token := strings.TrimSpace(part)
+		if token == "" {
+			continue
+		}
+		if _, supported := bedrockAnthropicBetaSupported[token]; !supported {
+			continue
+		}
+		if _, duplicate := seen[token]; duplicate {
+			continue
+		}
+		seen[token] = struct{}{}
+		filtered = append(filtered, token)
+	}
+	return strings.Join(filtered, ",")
+}
+
 func GetAPIVersion(c *gin.Context) string {
 	query := c.Request.URL.Query()
 	apiVersion := query.Get("api-version")

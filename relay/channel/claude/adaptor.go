@@ -3,16 +3,15 @@ package claude
 import (
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
-	"net/url"
-	"strings"
 	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/setting/model_setting"
+	"io"
+	"net/http"
+	"net/url"
 
 	"github.com/gin-gonic/gin"
 )
@@ -77,57 +76,16 @@ func shouldAppendClaudeBetaQuery(info *relaycommon.RelayInfo) bool {
 	return false
 }
 
-// bedrockSupportedBetaFlags lists anthropic-beta tokens that AWS Bedrock
-// is known to accept. When a channel has StripUnsupportedBeta enabled,
-// only these flags pass through; everything else is stripped so new
-// Claude CLI beta flags don't cause Bedrock 400 errors.
-// bedrockSupportedBetaFlags lists anthropic-beta tokens that AWS Bedrock
-// is known to accept (verified against hicode Bedrock, 2026-08-31).
-// When a channel has StripUnsupportedBeta enabled, only these flags pass
-// through; everything else is stripped so new Claude CLI beta flags don't
-// cause Bedrock 400 errors.
-var bedrockSupportedBetaFlags = map[string]bool{
-	"output-128k-2025-02-19":        true,
-	"token-efficient-tools-2025-02-19": true,
-	"interleaved-thinking-2025-05-14": true,
-	"pdfs-2024-09-25":               true,
-}
-
-// filterAnthropicBetaByWhitelist keeps only beta flags present in the allow list.
-func filterAnthropicBetaByWhitelist(beta string, allowed map[string]bool) string {
-	if beta == "" {
-		return ""
-	}
-	parts := strings.Split(beta, ",")
-	filtered := make([]string, 0, len(parts))
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p == "" {
-			continue
-		}
-		if allowed[p] {
-			filtered = append(filtered, p)
-		}
-	}
-	return strings.Join(filtered, ",")
-}
-
-
+// CommonClaudeHeadersOperation prepares headers for Claude-compatible upstreams.
+// Bedrock-facing channels use a whitelist, including after model-level headers
+// are merged, so later runtime overrides cannot restore unsupported flags.
 func CommonClaudeHeadersOperation(c *gin.Context, req *http.Header, info *relaycommon.RelayInfo) {
-	// common headers operation
 	anthropicBeta := c.Request.Header.Get("anthropic-beta")
 	if anthropicBeta != "" {
-		var filtered string
+		filtered := anthropicBeta
 		if info != nil && info.ChannelOtherSettings.StripUnsupportedBeta {
-			// Whitelist mode: only keep Bedrock-supported flags.
-			// New Claude CLI beta flags are stripped by default.
-			filtered = filterAnthropicBetaByWhitelist(anthropicBeta, bedrockSupportedBetaFlags)
-		} else {
-			// Pass-through mode: no filtering for non-Bedrock channels.
-			filtered = anthropicBeta
+			filtered = relaycommon.FilterBedrockAnthropicBeta(anthropicBeta)
 		}
-		// Overwrite the original request header so any downstream code path
-		// (retries, pass-through, header overrides) sees the filtered value.
 		c.Request.Header.Set("anthropic-beta", filtered)
 		if filtered != "" {
 			req.Set("anthropic-beta", filtered)
@@ -136,6 +94,14 @@ func CommonClaudeHeadersOperation(c *gin.Context, req *http.Header, info *relayc
 		}
 	}
 	model_setting.GetClaudeSettings().WriteHeaders(info.OriginModelName, req)
+	if info != nil && info.ChannelOtherSettings.StripUnsupportedBeta {
+		filtered := relaycommon.FilterBedrockAnthropicBeta(req.Get("anthropic-beta"))
+		if filtered != "" {
+			req.Set("anthropic-beta", filtered)
+		} else {
+			req.Del("anthropic-beta")
+		}
+	}
 }
 
 func (a *Adaptor) SetupRequestHeader(c *gin.Context, req *http.Header, info *relaycommon.RelayInfo) error {

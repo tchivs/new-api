@@ -119,6 +119,14 @@ func doAwsClientRequest(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor,
 	for key, value := range headerOverride {
 		requestHeader.Set(key, value)
 	}
+	if info.ChannelOtherSettings.StripUnsupportedBeta {
+		filteredBeta := relaycommon.FilterBedrockAnthropicBeta(requestHeader.Get("anthropic-beta"))
+		if filteredBeta != "" {
+			requestHeader.Set("anthropic-beta", filteredBeta)
+		} else {
+			requestHeader.Del("anthropic-beta")
+		}
+	}
 
 	if isNovaModel(awsModelId) {
 		var novaReq *NovaRequest
@@ -192,12 +200,11 @@ func buildAwsRequestBody(c *gin.Context, info *relaycommon.RelayInfo, awsClaudeR
 		}
 		delete(data, "model")
 		delete(data, "stream")
-		// Also strip anthropic_beta from body when beta header was filtered.
-		// Bedrock reads anthropic_beta from the body and converts it to the
-		// anthropic-beta header; unsupported flags cause 400 ValidationException.
+		// Strip the raw body field as well when the channel uses beta filtering.
 		if info.ChannelOtherSettings.StripUnsupportedBeta {
 			delete(data, "anthropic_beta")
 		}
+		return common.Marshal(data)
 	}
 	return common.Marshal(awsClaudeReq)
 }
