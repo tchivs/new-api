@@ -1,12 +1,18 @@
 package claude
 
 import (
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
+	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -373,4 +379,60 @@ func TestOpenAIChatRequestToClaudeMessages_ClaudeOpus48ThinkingUsesAdaptiveHighE
 	require.Nil(t, claudeRequest.Temperature)
 	require.Nil(t, claudeRequest.TopP)
 	require.Nil(t, claudeRequest.TopK)
+}
+
+func newClaudeStreamHandlerTest(t *testing.T, body string) (*httptest.ResponseRecorder, *relaycommon.RelayInfo, *types.NewAPIError) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	oldStreamingTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldStreamingTimeout })
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	info := &relaycommon.RelayInfo{
+		RelayFormat:     types.RelayFormatClaude,
+		OriginModelName: "claude-opus-5",
+		ChannelMeta: &relaycommon.ChannelMeta{
+			UpstreamModelName: "claude-opus-5",
+		},
+	}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+	}
+	_, apiErr := ClaudeStreamHandler(c, resp, info)
+	return recorder, info, apiErr
+}
+
+func TestClaudeStreamHandlerEmitsErrorOnBareEOF(t *testing.T) {
+	body := strings.Join([]string{
+		`data: {"type":"message_start","message":{"id":"msg_1","model":"claude-opus-5","usage":{"input_tokens":1,"output_tokens":0}}}`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}`,
+	}, "\n\n") + "\n\n"
+
+	recorder, info, apiErr := newClaudeStreamHandlerTest(t, body)
+
+	require.Nil(t, apiErr)
+	assert.Contains(t, recorder.Body.String(), "event: error")
+	assert.Contains(t, recorder.Body.String(), claudeStreamMissingMessageStop)
+	assert.NotContains(t, recorder.Body.String(), "event: message_stop")
+	require.NotNil(t, info.StreamStatus)
+	assert.Equal(t, relaycommon.StreamEndReasonEOF, info.StreamStatus.EndReason)
+	assert.True(t, info.StreamStatus.HasErrors())
+}
+
+func TestClaudeStreamHandlerStopsAtMessageStop(t *testing.T) {
+	body := strings.Join([]string{
+		`data: {"type":"message_start","message":{"id":"msg_1","model":"claude-opus-5","usage":{"input_tokens":1,"output_tokens":0}}}`,
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}`,
+		`data: {"type":"message_stop"}`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"after-stop"}}`,
+	}, "\n\n") + "\n\n"
+
+	recorder, _, apiErr := newClaudeStreamHandlerTest(t, body)
+
+	require.Nil(t, apiErr)
+	assert.Contains(t, recorder.Body.String(), "event: message_stop")
 }

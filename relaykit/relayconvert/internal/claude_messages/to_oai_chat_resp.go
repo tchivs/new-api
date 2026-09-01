@@ -13,12 +13,13 @@ import (
 )
 
 type ClaudeResponseInfo struct {
-	ResponseId   string
-	Created      int64
-	Model        string
-	ResponseText strings.Builder
-	Usage        *dto.Usage
-	Done         bool
+	ResponseId          string
+	Created             int64
+	Model               string
+	ResponseText        strings.Builder
+	Usage               *dto.Usage
+	Done                bool
+	MessageStopReceived bool
 }
 
 func StopReasonClaudeToOpenAI(reason string) string {

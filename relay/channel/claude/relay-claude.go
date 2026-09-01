@@ -90,6 +90,9 @@ func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 		common.SysLog("error unmarshalling stream response: " + err.Error())
 		return types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
+	if claudeResponse.Type == "message_stop" && claudeInfo != nil {
+		claudeInfo.MessageStopReceived = true
+	}
 	if claudeError := claudeResponse.GetClaudeError(); claudeError != nil && claudeError.Type != "" {
 		return types.WithClaudeError(*claudeError, http.StatusInternalServerError)
 	}
@@ -191,6 +194,28 @@ func HandleStreamFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, clau
 	}
 }
 
+const claudeStreamMissingMessageStop = "upstream Claude stream ended before message_stop"
+
+func newClaudeStreamIncompleteError() *types.NewAPIError {
+	return types.WithClaudeError(types.ClaudeError{
+		Type:    "api_error",
+		Message: claudeStreamMissingMessageStop,
+	}, http.StatusBadGateway)
+}
+
+func writeClaudeStreamError(c *gin.Context, apiErr *types.NewAPIError) {
+	if c == nil || c.Request == nil || c.Request.Context().Err() != nil || apiErr == nil {
+		return
+	}
+	response := dto.ClaudeResponse{
+		Type:  "error",
+		Error: apiErr.ToClaudeError(),
+	}
+	if err := helper.ClaudeData(c, response); err != nil {
+		logger.LogError(c, "send Claude stream error failed: "+err.Error())
+	}
+}
+
 func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (*dto.Usage, *types.NewAPIError) {
 	claudeInfo := &ClaudeResponseInfo{
 		ResponseId:   helper.GetResponseID(c),
@@ -204,13 +229,37 @@ func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 		err = HandleStreamResponseData(c, info, claudeInfo, data)
 		if err != nil {
 			sr.Stop(err)
+			return
+		}
+		if claudeInfo.MessageStopReceived {
+			// Native Anthropic streams do not require [DONE]. Stop reading as
+			// soon as message_stop arrives; some proxies keep the body open.
+			sr.Done()
 		}
 	})
 	if err != nil {
+		if info.RelayFormat == types.RelayFormatClaude &&
+			c != nil && c.Writer != nil && c.Writer.Written() &&
+			c.Request != nil && c.Request.Context().Err() == nil {
+			writeClaudeStreamError(c, err)
+			return claudeInfo.Usage, nil
+		}
 		return nil, err
 	}
 
 	HandleStreamFinalResponse(c, info, claudeInfo)
+	if info.RelayFormat == types.RelayFormatClaude && !claudeInfo.MessageStopReceived {
+		incompleteErr := newClaudeStreamIncompleteError()
+		if info.StreamStatus != nil {
+			info.StreamStatus.RecordError(claudeStreamMissingMessageStop)
+		}
+		if c != nil && c.Writer != nil && c.Writer.Written() &&
+			c.Request != nil && c.Request.Context().Err() == nil {
+			writeClaudeStreamError(c, incompleteErr)
+			return claudeInfo.Usage, nil
+		}
+		return nil, incompleteErr
+	}
 	return claudeInfo.Usage, nil
 }
 
