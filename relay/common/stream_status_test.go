@@ -20,6 +20,18 @@ func TestStreamStatus_SetEndReason_FirstWins(t *testing.T) {
 	assert.Nil(t, s.EndError)
 }
 
+func TestStreamStatus_MarkCompletedOverridesLateClientGone(t *testing.T) {
+	t.Parallel()
+	s := NewStreamStatus()
+	s.SetEndReason(StreamEndReasonClientGone, fmt.Errorf("context canceled"))
+
+	s.MarkCompleted()
+
+	assert.Equal(t, StreamEndReasonDone, s.EndReason)
+	assert.Nil(t, s.EndError)
+	assert.True(t, s.IsNormalEnd())
+}
+
 func TestStreamStatus_SetEndReason_WithError(t *testing.T) {
 	t.Parallel()
 	s := NewStreamStatus()

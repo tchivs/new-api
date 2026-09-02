@@ -197,6 +197,11 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	}
 
 	dataChan := make(chan string, 10)
+	dataHandlerDone := make(chan struct{})
+	var closeDataChanOnce sync.Once
+	closeDataChan := func() {
+		closeDataChanOnce.Do(func() { close(dataChan) })
+	}
 
 	wg.Add(1)
 	gopool.Go(func() {
@@ -205,6 +210,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 				logger.LogError(c, fmt.Sprintf("data handler goroutine panic: %v", r))
 				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonPanic, fmt.Errorf("handler panic: %v", r))
 			}
+			close(dataHandlerDone)
 			stop()
 			wg.Done()
 		}()
@@ -227,7 +233,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	wg.Add(1)
 	common.RelayCtxGo(ctx, func() {
 		defer func() {
-			close(dataChan)
+			closeDataChan()
 			if r := recover(); r != nil {
 				logger.LogError(c, fmt.Sprintf("scanner goroutine panic: %v", r))
 				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonPanic, fmt.Errorf("scanner panic: %v", r))
@@ -286,6 +292,11 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, err)
 			}
 		}
+		// Drain all already-read events before recording EOF. Without this,
+		// a fast upstream can set EOF and close stopChan before the handler
+		// goroutine processes a terminal response event.
+		closeDataChan()
+		<-dataHandlerDone
 		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonEOF, nil)
 	})
 
@@ -296,9 +307,18 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	case <-stopChan:
 		// EndReason already set by the goroutine that triggered stopChan
 	case <-c.Request.Context().Done():
-		// 客户端断开：立即 cleanup 关闭上游 resp.Body，解除 scanner 阻塞并让上游停止生成，
-		// 避免为已放弃的请求继续消费上游 token。
-		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, c.Request.Context().Err())
+		// Both the client context and the scanner completion can become
+		// ready at the same time. Prefer the scanner's terminal reason when
+		// cleanup has already started; otherwise a normal completed stream
+		// is incorrectly recorded as client_gone.
+		select {
+		case <-stopChan:
+			// The scanner/handler already set the terminal reason.
+		default:
+			// 客户端断开：立即 cleanup 关闭上游 resp.Body，解除 scanner 阻塞并让上游停止生成，
+			// 避免为已放弃的请求继续消费上游 token。
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, c.Request.Context().Err())
+		}
 	}
 
 	cleanup()

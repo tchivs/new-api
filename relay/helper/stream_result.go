@@ -35,8 +35,10 @@ func (r *StreamResult) Stop(err error) {
 }
 
 // Done signals that the handler has finished processing normally
-// (e.g., Dify "message_end"). The stream stops after this chunk.
+// (e.g., Dify "message_end"). The explicit completion signal wins over a
+// client cancellation that arrives after the final response bytes were sent.
 func (r *StreamResult) Done() {
+	r.status.MarkCompleted()
 	r.status.SetEndReason(relaycommon.StreamEndReasonDone, nil)
 	r.stopped = true
 }

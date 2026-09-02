@@ -160,6 +160,11 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 				imageCounter.Commit(info)
 				imageCommitted = true
 			}
+			// A terminal response event is the strongest evidence that the
+			// downstream stream completed. Mark it before the scanner waits
+			// for a provider-specific [DONE], so a late client-context
+			// cancellation cannot overwrite a successful terminal event.
+			sr.Done()
 		case "response.failed", "response.incomplete", "response.cancelled", "response.canceled":
 			terminalEventSent = true
 			// Error event was already forwarded above. Extract error for billing.
