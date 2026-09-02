@@ -117,8 +117,12 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			return
 		}
 
-		// Forward event to client
-		sendResponsesStreamData(c, streamResponse, data)
+		// Forward event to client; a failed write is a real client-side
+		// termination and must not be followed by a synthetic completion.
+		if err := sendResponsesStreamData(c, streamResponse, data); err != nil {
+			sr.Stop(err)
+			return
+		}
 		if streamResponse.Type != "response.failed" && streamResponse.Type != "response.incomplete" &&
 			streamResponse.Type != "response.cancelled" && streamResponse.Type != "response.canceled" {
 			dataForwarded = true
