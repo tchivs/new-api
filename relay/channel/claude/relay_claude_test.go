@@ -7,8 +7,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -329,8 +331,27 @@ func TestBuildOpenAIStyleUsageFromClaudeUsageDefaultsAggregateCacheCreationTo5m(
 	require.Equal(t, 0, openAIUsage.ClaudeCacheCreation1hTokens)
 }
 
+func applyOpenAIChatReasoningThroughHandlerOrder(t *testing.T, original dto.GeneralOpenAIRequest) (*dto.GeneralOpenAIRequest, *relaycommon.RelayInfo) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+
+	info := &relaycommon.RelayInfo{
+		OriginModelName: original.Model,
+		Request:         &original,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			UpstreamModelName: original.Model,
+		},
+	}
+	outbound, err := common.DeepCopy(&original)
+	require.NoError(t, err)
+	require.NoError(t, helper.ModelMappedHelper(c, info, outbound))
+	require.NoError(t, helper.ApplyReasoningModelSuffix(info, outbound))
+	return outbound, info
+}
+
 func TestOpenAIChatRequestToClaudeMessages_ClaudeOpus48HighUsesAdaptiveThinking(t *testing.T) {
-	request := dto.GeneralOpenAIRequest{
+	original := dto.GeneralOpenAIRequest{
 		Model:       "claude-opus-4-8-high",
 		Temperature: commonPointer(0.7),
 		TopP:        commonPointer(0.9),
@@ -343,7 +364,8 @@ func TestOpenAIChatRequestToClaudeMessages_ClaudeOpus48HighUsesAdaptiveThinking(
 		},
 	}
 
-	claudeRequest, err := relayconvert.OpenAIChatRequestToClaudeMessages(nil, &relaycommon.RelayInfo{}, request)
+	outbound, info := applyOpenAIChatReasoningThroughHandlerOrder(t, original)
+	claudeRequest, err := relayconvert.OpenAIChatRequestToClaudeMessages(nil, info, *outbound)
 	require.NoError(t, err)
 	require.Equal(t, "claude-opus-4-8", claudeRequest.Model)
 	require.NotNil(t, claudeRequest.Thinking)
@@ -356,7 +378,7 @@ func TestOpenAIChatRequestToClaudeMessages_ClaudeOpus48HighUsesAdaptiveThinking(
 }
 
 func TestOpenAIChatRequestToClaudeMessages_ClaudeOpus48ThinkingUsesAdaptiveHighEffort(t *testing.T) {
-	request := dto.GeneralOpenAIRequest{
+	original := dto.GeneralOpenAIRequest{
 		Model:       "claude-opus-4-8-thinking",
 		Temperature: commonPointer(0.7),
 		TopP:        commonPointer(0.9),
@@ -369,7 +391,8 @@ func TestOpenAIChatRequestToClaudeMessages_ClaudeOpus48ThinkingUsesAdaptiveHighE
 		},
 	}
 
-	claudeRequest, err := relayconvert.OpenAIChatRequestToClaudeMessages(nil, &relaycommon.RelayInfo{}, request)
+	outbound, info := applyOpenAIChatReasoningThroughHandlerOrder(t, original)
+	claudeRequest, err := relayconvert.OpenAIChatRequestToClaudeMessages(nil, info, *outbound)
 	require.NoError(t, err)
 	require.Equal(t, "claude-opus-4-8", claudeRequest.Model)
 	require.NotNil(t, claudeRequest.Thinking)

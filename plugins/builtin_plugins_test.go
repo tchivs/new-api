@@ -63,7 +63,7 @@ func TestBuiltInVendorPluginsDeclareNativeRoutesAndLegacyChannelTypes(t *testing
 }
 
 func TestBuiltInTaskPluginResponsesAndUsageContracts(t *testing.T) {
-	expectedKeys := []string{"alibaba", "doubao", "google", "hailuo", "jimeng", "kling", "sora", "sunoapi", "vertex-ai", "vidu"}
+	expectedKeys := []string{"alibaba", "doubao", "google", "hailuo", "jimeng", "kling", "sora", "sunoapi", "tokenmart", "vertex-ai", "vidu"}
 	generation := jsplugin.DefaultRegistry.Generation()
 	require.NotNil(t, generation)
 
@@ -97,17 +97,27 @@ func TestBuiltInTaskPluginResponsesAndUsageContracts(t *testing.T) {
 					break
 				}
 			}
-			require.True(t, foundResponses, "openai_responses claim must be present")
-			assert.Equal(t, []string{"stream", "sync", "background"}, responsesClaim.Supports)
-			for _, model := range plugin.Meta.Models {
-				binding, claimed := registry.Generation().LookupEndpoint("POST", "/v1/responses", model)
-				require.True(t, claimed, model)
-				assert.Same(t, plugin, binding.Plugin)
-			}
-			for _, hook := range []string{"decodeRequest", "renderEvents", "renderFinal"} {
-				callable, callableErr := plugin.Engine.HasCallablePath(t.Context(), "protocols", "openai_responses", hook)
-				require.NoError(t, callableErr)
-				assert.True(t, callable, hook)
+			if foundResponses {
+				assert.Equal(t, []string{"stream", "sync", "background"}, responsesClaim.Supports)
+				for _, model := range plugin.Meta.Models {
+					binding, claimed := registry.Generation().LookupEndpoint("POST", "/v1/responses", model)
+					require.True(t, claimed, model)
+					assert.Same(t, plugin, binding.Plugin)
+				}
+				for _, hook := range []string{"decodeRequest", "renderEvents", "renderFinal"} {
+					callable, callableErr := plugin.Engine.HasCallablePath(t.Context(), "protocols", "openai_responses", hook)
+					require.NoError(t, callableErr)
+					assert.True(t, callable, hook)
+				}
+			} else {
+				foundVideo := false
+				for _, claim := range plugin.Meta.Protocols {
+					if claim.Name == "openai_video" {
+						foundVideo = true
+						break
+					}
+				}
+				require.True(t, foundVideo, "plugin must declare a supported protocol")
 			}
 			for _, hook := range []string{"extractUsage", "extractUsageOnComplete"} {
 				callable, callableErr := plugin.Engine.HasExport(t.Context(), hook)
