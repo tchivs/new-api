@@ -424,41 +424,21 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, err *t
 		modelName := c.GetString("original_model")
 		tokenId := c.GetInt("token_id")
 		userGroup := c.GetString("group")
-		channelId := c.GetInt("channel_id")
-		other := make(map[string]interface{})
+		other := model.NewLogOther()
 		if c.Request != nil && c.Request.URL != nil {
-			other["request_path"] = c.Request.URL.Path
+			other.SetPublic("request_path", c.Request.URL.Path)
 		}
-		other["error_type"] = err.GetErrorType()
-		other["error_code"] = err.GetErrorCode()
-		other["status_code"] = err.StatusCode
-		other["channel_id"] = channelId
-		other["channel_name"] = c.GetString("channel_name")
-		other["channel_type"] = c.GetInt("channel_type")
-		adminInfo := make(map[string]interface{})
-		adminInfo["use_channel"] = c.GetStringSlice("use_channel")
-		if relayInfo != nil {
-			if diagnostics := relayInfo.ConversionDiagnostics(); len(diagnostics) > 0 {
-				adminInfo["conversion_diagnostics"] = diagnostics
-			}
-			if relayInfo.ConversionDiagnosticsTruncated() {
-				adminInfo["conversion_diagnostics_truncated"] = true
-			}
-		}
-		isMultiKey := common.GetContextKeyBool(c, constant.ContextKeyChannelIsMultiKey)
-		if isMultiKey {
-			adminInfo["is_multi_key"] = true
-			adminInfo["multi_key_index"] = common.GetContextKeyInt(c, constant.ContextKeyChannelMultiKeyIndex)
-		}
-		service.AppendChannelAffinityAdminInfo(c, adminInfo)
-		other["admin_info"] = adminInfo
+		other.SetPublic("error_type", err.GetErrorType())
+		other.SetPublic("error_code", err.GetErrorCode())
+		other.SetPublic("status_code", err.StatusCode)
+		service.AppendRelayLogAdminInfo(c, relayInfo, other)
 		service.AppendTaskPluginContextAuditInfo(c, other)
 		startTime := common.GetContextKeyTime(c, constant.ContextKeyRequestStartTime)
 		if startTime.IsZero() {
 			startTime = time.Now()
 		}
 		useTimeSeconds := int(time.Since(startTime).Seconds())
-		model.RecordErrorLog(c, userId, channelId, modelName, tokenName, err.MaskSensitiveErrorWithStatusCode(), tokenId, useTimeSeconds, common.GetContextKeyBool(c, constant.ContextKeyIsStream), userGroup, other)
+		model.RecordErrorLog(c, userId, channelError.ChannelId, modelName, tokenName, err.MaskSensitiveErrorWithStatusCode(), tokenId, useTimeSeconds, common.GetContextKeyBool(c, constant.ContextKeyIsStream), userGroup, other)
 	}
 
 }
@@ -519,6 +499,11 @@ func RelayNotImplemented(c *gin.Context) {
 }
 
 func RelayNotFound(c *gin.Context) {
+	// The web fallback may already have applied static-asset cache headers.
+	// A missing API or asset can appear after an upgrade; never cache its 404.
+	c.Header("Cache-Control", "no-store, no-cache, must-revalidate, private, max-age=0")
+	c.Header("Pragma", "no-cache")
+	c.Header("Expires", "0")
 	err := types.OpenAIError{
 		Message: fmt.Sprintf("Invalid URL (%s %s)", c.Request.Method, c.Request.URL.Path),
 		Type:    "invalid_request_error",
@@ -777,6 +762,9 @@ func executeTaskSubmissionWith(
 	}
 	task.Quota = result.Quota
 	task.Data = result.TaskData
+	if len(result.PluginState) > 0 {
+		task.PrivateData.PluginState = result.PluginState
+	}
 	task.Action = relayInfo.Action
 	if immediate := result.Immediate; immediate != nil {
 		task.Status = model.TaskStatus(immediate.Status)
@@ -887,7 +875,7 @@ func respondTaskError(c *gin.Context, taskErr *taskdto.TaskError) {
 }
 
 func shouldRetryTaskRelay(c *gin.Context, channelId int, taskErr *taskdto.TaskError, retryTimes int) bool {
-	if taskErr == nil {
+	if taskErr == nil || taskErr.NoRetry {
 		return false
 	}
 	if service.ShouldSkipRetryAfterChannelAffinityFailure(c) {
