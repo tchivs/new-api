@@ -14,10 +14,13 @@ type StatusCodeRange struct {
 	End   int
 }
 
-var AutomaticDisableStatusCodeRanges = []StatusCodeRange{{Start: 401, End: 401}}
+var AutomaticDisableStatusCodeRanges = []StatusCodeRange{{Start: 401, End: 401}, {Start: 402, End: 402}}
 
 // Default behavior matches legacy hardcoded retry rules in controller/relay.go shouldRetry:
 // retry for 1xx, 3xx, 4xx(except 400/408), 5xx(except 504/524), and no retry for 2xx.
+// 400 stays non-retryable on purpose: a malformed request is not fixed by another
+// channel, and 402 (payment required) is auto-disable only, never retried into a
+// dead upstream.
 var AutomaticRetryStatusCodeRanges = []StatusCodeRange{
 	{Start: 100, End: 199},
 	{Start: 300, End: 399},

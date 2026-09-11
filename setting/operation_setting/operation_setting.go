@@ -13,6 +13,8 @@ var AutomaticDisableKeywords = []string{
 	"The security token included in the request is invalid",
 	"Operation not allowed",
 	"Your account is not authorized",
+	"Insufficient Balance",
+	"余额不足",
 }
 
 func AutomaticDisableKeywordsToString() string {

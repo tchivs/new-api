@@ -117,14 +117,16 @@ type SiliconFlowUsageResponse struct {
 	} `json:"data"`
 }
 
+type DeepSeekBalanceInfo struct {
+	Currency        string `json:"currency"`
+	TotalBalance    string `json:"total_balance"`
+	GrantedBalance  string `json:"granted_balance"`
+	ToppedUpBalance string `json:"topped_up_balance"`
+}
+
 type DeepSeekUsageResponse struct {
-	IsAvailable  bool `json:"is_available"`
-	BalanceInfos []struct {
-		Currency        string `json:"currency"`
-		TotalBalance    string `json:"total_balance"`
-		GrantedBalance  string `json:"granted_balance"`
-		ToppedUpBalance string `json:"topped_up_balance"`
-	} `json:"balance_infos"`
+	IsAvailable  bool                  `json:"is_available"`
+	BalanceInfos []DeepSeekBalanceInfo `json:"balance_infos"`
 }
 
 type OpenRouterCreditResponse struct {
@@ -275,6 +277,26 @@ func updateChannelSiliconFlowBalance(channel *model.Channel) (float64, error) {
 	return balance, nil
 }
 
+// pickDeepSeekBalance returns the index of the balance entry to use. DeepSeek
+// reports CNY for domestic accounts and USD for international ones; prefer CNY,
+// then USD, then whatever single entry the upstream returned. Returns -1 when
+// the response carries no balance entry at all.
+func pickDeepSeekBalance(infos []DeepSeekBalanceInfo) int {
+	index := -1
+	for i, info := range infos {
+		if info.Currency == "CNY" {
+			return i
+		}
+		if index == -1 && info.Currency == "USD" {
+			index = i
+		}
+	}
+	if index == -1 && len(infos) > 0 {
+		index = 0
+	}
+	return index
+}
+
 func updateChannelDeepSeekBalance(channel *model.Channel) (float64, error) {
 	url := "https://api.deepseek.com/user/balance"
 	body, err := GetResponseBody("GET", url, channel, GetAuthHeader(channel.Key))
@@ -286,15 +308,9 @@ func updateChannelDeepSeekBalance(channel *model.Channel) (float64, error) {
 	if err != nil {
 		return 0, err
 	}
-	index := -1
-	for i, balanceInfo := range response.BalanceInfos {
-		if balanceInfo.Currency == "CNY" {
-			index = i
-			break
-		}
-	}
+	index := pickDeepSeekBalance(response.BalanceInfos)
 	if index == -1 {
-		return 0, errors.New("currency CNY not found")
+		return 0, fmt.Errorf("no balance info in response (is_available=%v)", response.IsAvailable)
 	}
 	balance, err := strconv.ParseFloat(response.BalanceInfos[index].TotalBalance, 64)
 	if err != nil {
