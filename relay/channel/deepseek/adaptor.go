@@ -1,6 +1,8 @@
 package deepseek
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -169,7 +171,80 @@ func (a *Adaptor) ConvertEmbeddingRequest(c *gin.Context, info *relaycommon.Rela
 
 func (a *Adaptor) ConvertOpenAIResponsesRequest(_ *gin.Context, info *relaycommon.RelayInfo, request dto.OpenAIResponsesRequest) (any, error) {
 	applyDeepSeekV4ResponsesThinkingSuffix(info, &request)
+	backfillDeepSeekResponsesReasoningText(&request)
 	return request, nil
+}
+
+// deepSeekReasoningTextPlaceholder fills reasoning items that carry neither
+// reasoning_text nor a summary to fall back to.
+const deepSeekReasoningTextPlaceholder = "reasoning unavailable"
+
+// backfillDeepSeekResponsesReasoningText gives every reasoning item in `input` a
+// non-empty `content` array. DeepSeek's Responses endpoint rejects the whole
+// turn with `The reasoning_text in the thinking mode must be passed back to the
+// API.` as soon as one reasoning item has no reasoning_text, and it rejects the
+// turn again if such an item is simply removed, because the assistant turn it
+// belongs to then loses its reasoning. Items that carry only `summary` are
+// routine once a conversation mixes models: OpenAI reasoning items ship summary
+// plus encrypted_content, never reasoning_text. Requests in either shape always
+// fail upstream, so recovering the text from `summary` (or a marker when there
+// is no summary at all) only turns a guaranteed 400 into the answer the client
+// asked for.
+func backfillDeepSeekResponsesReasoningText(request *dto.OpenAIResponsesRequest) {
+	if request == nil || len(request.Input) == 0 {
+		return
+	}
+	// `input` is either a plain string or an array of items.
+	var items []json.RawMessage
+	if err := common.Unmarshal(request.Input, &items); err != nil {
+		return
+	}
+	changed := false
+	for i, raw := range items {
+		var probe struct {
+			Type    string          `json:"type"`
+			Content json.RawMessage `json:"content"`
+			Summary []struct {
+				Text string `json:"text"`
+			} `json:"summary"`
+		}
+		if err := common.Unmarshal(raw, &probe); err != nil || probe.Type != "reasoning" {
+			continue
+		}
+		if content := bytes.TrimSpace(probe.Content); len(content) > 0 && !bytes.Equal(content, []byte("null")) {
+			var entries []json.RawMessage
+			if err := common.Unmarshal(content, &entries); err != nil || len(entries) > 0 {
+				continue
+			}
+		}
+		var builder strings.Builder
+		for _, summary := range probe.Summary {
+			builder.WriteString(summary.Text)
+		}
+		text := strings.TrimSpace(builder.String())
+		if text == "" {
+			text = deepSeekReasoningTextPlaceholder
+		}
+		var item map[string]any
+		if err := common.Unmarshal(raw, &item); err != nil {
+			continue
+		}
+		item["content"] = []map[string]string{{"type": "reasoning_text", "text": text}}
+		encoded, err := common.Marshal(item)
+		if err != nil {
+			continue
+		}
+		items[i] = encoded
+		changed = true
+	}
+	if !changed {
+		return
+	}
+	encoded, err := common.Marshal(items)
+	if err != nil {
+		return
+	}
+	request.Input = encoded
 }
 
 func applyDeepSeekV4ResponsesThinkingSuffix(info *relaycommon.RelayInfo, request *dto.OpenAIResponsesRequest) {
