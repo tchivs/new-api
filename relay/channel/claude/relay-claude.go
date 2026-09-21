@@ -342,16 +342,25 @@ func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 
 	HandleStreamFinalResponse(c, info, claudeInfo)
 	if info.RelayFormat == types.RelayFormatClaude && !claudeInfo.MessageStopReceived {
-		incompleteErr := newClaudeStreamIncompleteError()
-		if info.StreamStatus != nil {
-			info.StreamStatus.RecordError(claudeStreamMissingMessageStop)
+		// A client that hung up makes the scanner abort the upstream read, so the
+		// missing terminal event is not an upstream fault. Reporting it as a channel
+		// error records a false 502 and retries a request nobody is waiting for.
+		clientGone := (c != nil && c.Request != nil && c.Request.Context().Err() != nil) ||
+			(info.StreamStatus != nil &&
+				(info.StreamStatus.EndReason == relaycommon.StreamEndReasonClientGone ||
+					info.StreamStatus.EndReason == relaycommon.StreamEndReasonHandlerStop))
+		if !clientGone {
+			incompleteErr := newClaudeStreamIncompleteError()
+			if info.StreamStatus != nil {
+				info.StreamStatus.RecordError(claudeStreamMissingMessageStop)
+			}
+			if c != nil && c.Writer != nil && c.Writer.Written() &&
+				c.Request != nil && c.Request.Context().Err() == nil {
+				writeClaudeStreamError(c, incompleteErr)
+				return claudeInfo.Usage, nil
+			}
+			return nil, incompleteErr
 		}
-		if c != nil && c.Writer != nil && c.Writer.Written() &&
-			c.Request != nil && c.Request.Context().Err() == nil {
-			writeClaudeStreamError(c, incompleteErr)
-			return claudeInfo.Usage, nil
-		}
-		return nil, incompleteErr
 	}
 	return claudeInfo.Usage, nil
 }

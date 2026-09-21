@@ -1,6 +1,7 @@
 package claude
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -459,4 +460,40 @@ func TestClaudeStreamHandlerStopsAtMessageStop(t *testing.T) {
 
 	require.Nil(t, apiErr)
 	assert.Contains(t, recorder.Body.String(), "event: message_stop")
+}
+
+func TestClaudeStreamHandlerClientGoneIsNotUpstreamTruncation(t *testing.T) {
+	body := strings.Join([]string{
+		`data: {"type":"message_start","message":{"id":"msg_1","model":"claude-opus-5","usage":{"input_tokens":1,"output_tokens":0}}}`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}`,
+	}, "\n\n") + "\n\n"
+
+	gin.SetMode(gin.TestMode)
+	oldStreamingTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldStreamingTimeout })
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	// A hung-up caller cancels the request context; the scanner then records
+	// client_gone instead of a terminal message_stop.
+	canceledCtx, cancel := context.WithCancel(c.Request.Context())
+	cancel()
+	c.Request = c.Request.WithContext(canceledCtx)
+	info := &relaycommon.RelayInfo{
+		RelayFormat: types.RelayFormatClaude,
+		ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "claude-opus-5"},
+	}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+	}
+
+	_, apiErr := ClaudeStreamHandler(c, resp, info)
+
+	require.Nil(t, apiErr)
+	assert.NotContains(t, recorder.Body.String(), claudeStreamMissingMessageStop)
+	require.NotNil(t, info.StreamStatus)
+	assert.False(t, info.StreamStatus.HasErrors())
 }
