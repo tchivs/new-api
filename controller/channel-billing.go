@@ -117,16 +117,14 @@ type SiliconFlowUsageResponse struct {
 	} `json:"data"`
 }
 
-type DeepSeekBalanceInfo struct {
-	Currency        string `json:"currency"`
-	TotalBalance    string `json:"total_balance"`
-	GrantedBalance  string `json:"granted_balance"`
-	ToppedUpBalance string `json:"topped_up_balance"`
-}
-
 type DeepSeekUsageResponse struct {
-	IsAvailable  bool                  `json:"is_available"`
-	BalanceInfos []DeepSeekBalanceInfo `json:"balance_infos"`
+	IsAvailable  bool `json:"is_available"`
+	BalanceInfos []struct {
+		Currency        string `json:"currency"`
+		TotalBalance    string `json:"total_balance"`
+		GrantedBalance  string `json:"granted_balance"`
+		ToppedUpBalance string `json:"topped_up_balance"`
+	} `json:"balance_infos"`
 }
 
 type OpenRouterCreditResponse struct {
@@ -277,24 +275,65 @@ func updateChannelSiliconFlowBalance(channel *model.Channel) (float64, error) {
 	return balance, nil
 }
 
-// pickDeepSeekBalance returns the index of the balance entry to use. DeepSeek
-// reports CNY for domestic accounts and USD for international ones; prefer CNY,
-// then USD, then whatever single entry the upstream returned. Returns -1 when
-// the response carries no balance entry at all.
-func pickDeepSeekBalance(infos []DeepSeekBalanceInfo) int {
-	index := -1
-	for i, info := range infos {
-		if info.Currency == "CNY" {
-			return i
-		}
-		if index == -1 && info.Currency == "USD" {
-			index = i
+func getDeepSeekBalanceUSD(response DeepSeekUsageResponse, usdExchangeRate float64) (float64, error) {
+	var usdBalance *string
+	var cnyBalance *string
+
+	for i := range response.BalanceInfos {
+		balanceInfo := &response.BalanceInfos[i]
+		switch balanceInfo.Currency {
+		case "USD":
+			if usdBalance == nil {
+				usdBalance = &balanceInfo.TotalBalance
+			}
+		case "CNY":
+			if cnyBalance == nil {
+				cnyBalance = &balanceInfo.TotalBalance
+			}
 		}
 	}
-	if index == -1 && len(infos) > 0 {
-		index = 0
+
+	if usdBalance != nil {
+		balance, err := strconv.ParseFloat(*usdBalance, 64)
+		if err != nil {
+			return 0, err
+		}
+		if math.IsNaN(balance) || math.IsInf(balance, 0) {
+			return 0, errors.New("USD balance must be finite")
+		}
+		if balance < 0 {
+			return 0, errors.New("USD balance must be non-negative")
+		}
+		return balance, nil
 	}
-	return index
+	if cnyBalance == nil {
+		return 0, errors.New("currency USD or CNY not found")
+	}
+	if math.IsNaN(usdExchangeRate) || math.IsInf(usdExchangeRate, 0) {
+		return 0, errors.New("USD exchange rate must be finite")
+	}
+	if usdExchangeRate <= 0 {
+		return 0, errors.New("USD exchange rate must be greater than zero")
+	}
+
+	balanceCNY, err := strconv.ParseFloat(*cnyBalance, 64)
+	if err != nil {
+		return 0, err
+	}
+	if math.IsNaN(balanceCNY) || math.IsInf(balanceCNY, 0) {
+		return 0, errors.New("CNY balance must be finite")
+	}
+	if balanceCNY < 0 {
+		return 0, errors.New("CNY balance must be non-negative")
+	}
+	balanceUSD := decimal.NewFromFloat(balanceCNY).Div(decimal.NewFromFloat(usdExchangeRate)).InexactFloat64()
+	if math.IsNaN(balanceUSD) || math.IsInf(balanceUSD, 0) {
+		return 0, errors.New("converted USD balance must be finite")
+	}
+	if balanceUSD < 0 {
+		return 0, errors.New("converted USD balance must be non-negative")
+	}
+	return balanceUSD, nil
 }
 
 func updateChannelDeepSeekBalance(channel *model.Channel) (float64, error) {
@@ -308,11 +347,7 @@ func updateChannelDeepSeekBalance(channel *model.Channel) (float64, error) {
 	if err != nil {
 		return 0, err
 	}
-	index := pickDeepSeekBalance(response.BalanceInfos)
-	if index == -1 {
-		return 0, fmt.Errorf("no balance info in response (is_available=%v)", response.IsAvailable)
-	}
-	balance, err := strconv.ParseFloat(response.BalanceInfos[index].TotalBalance, 64)
+	balance, err := getDeepSeekBalanceUSD(response, operation_setting.USDExchangeRate)
 	if err != nil {
 		return 0, err
 	}

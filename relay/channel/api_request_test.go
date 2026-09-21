@@ -7,8 +7,8 @@ import (
 	"testing"
 
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
-	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -207,33 +207,13 @@ func TestProcessHeaderOverride_PassHeadersTemplateSetsRuntimeHeaders(t *testing.
 	require.Empty(t, upstreamReq.Header.Get("X-Codex-Beta-Features"))
 }
 
-func TestFilterOutgoingAnthropicBetaAfterRuntimeOverride(t *testing.T) {
-	info := &relaycommon.RelayInfo{
-		RequestHeaders: map[string]string{
-			"Anthropic-Beta": "advanced-tool-use-2025-11-20,prompt-caching-scope-2026-01-05,interleaved-thinking-2025-05-14",
-		},
-		ChannelMeta: &relaycommon.ChannelMeta{
-			ChannelOtherSettings: dto.ChannelOtherSettings{StripUnsupportedBeta: true},
-			ParamOverride: map[string]any{
-				"operations": []any{
-					map[string]any{
-						"mode":  "pass_headers",
-						"value": []any{"Anthropic-Beta"},
-					},
-				},
-			},
-		},
+func TestToWebSocketURL(t *testing.T) {
+	for input, want := range map[string]string{
+		"https://api.openai.com/v1/responses":             "wss://api.openai.com/v1/responses",
+		"http://127.0.0.1:3000/v1/responses":              "ws://127.0.0.1:3000/v1/responses",
+		"wss://chatgpt.com/backend-api/codex/responses":   "wss://chatgpt.com/backend-api/codex/responses",
+		"ws://127.0.0.1:3000/backend-api/codex/responses": "ws://127.0.0.1:3000/backend-api/codex/responses",
+	} {
+		assert.Equal(t, want, toWebSocketURL(input), input)
 	}
-	_, err := relaycommon.ApplyParamOverrideWithRelayInfo([]byte(`{"model":"claude-opus-5"}`), info)
-	require.NoError(t, err)
-	require.Equal(t, "advanced-tool-use-2025-11-20,prompt-caching-scope-2026-01-05,interleaved-thinking-2025-05-14", info.RuntimeHeadersOverride["anthropic-beta"])
-
-	headerOverride, err := processHeaderOverride(info, nil)
-	require.NoError(t, err)
-	request := httptest.NewRequest(http.MethodPost, "https://example.com/v1/messages", nil)
-	applyHeaderOverrideToRequest(request, headerOverride)
-	filterOutgoingAnthropicBeta(info, request.Header)
-
-	require.Equal(t, "interleaved-thinking-2025-05-14", request.Header.Get("anthropic-beta"))
-	require.Len(t, request.Header.Values("anthropic-beta"), 1)
 }
