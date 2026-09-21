@@ -43,6 +43,7 @@ func (a *Adaptor) ConvertClaudeRequest(c *gin.Context, info *relaycommon.RelayIn
 	if err := applyDeepSeekV4ClaudeThinkingSuffix(info, claudeRequest); err != nil {
 		return nil, err
 	}
+	backfillDeepSeekClaudeThinkingBlocks(claudeRequest)
 	return claudeRequest, nil
 }
 
@@ -92,7 +93,7 @@ func (a *Adaptor) ConvertOpenAIRequest(c *gin.Context, info *relaycommon.RelayIn
 	if err := applyDeepSeekV4OpenAIThinkingSuffix(info, request); err != nil {
 		return nil, err
 	}
-
+	backfillDeepSeekOpenAIReasoningContent(request)
 	return request, nil
 }
 
@@ -177,9 +178,80 @@ func (a *Adaptor) ConvertOpenAIResponsesRequest(_ *gin.Context, info *relaycommo
 	return request, nil
 }
 
-// deepSeekReasoningTextPlaceholder fills reasoning items that carry neither
-// reasoning_text nor a summary to fall back to.
-const deepSeekReasoningTextPlaceholder = "reasoning unavailable"
+// DeepSeek rejects replayed tool-call turns whose reasoning echo is missing. The
+// field carrying it differs per wire format — reasoning_text, content[].thinking,
+// reasoning_content — but the requirement is the same one, so all three backfills
+// share this placeholder. It acknowledges unavailable history; it does not
+// recover the model's original reasoning.
+const deepSeekReasoningPlaceholder = "reasoning unavailable"
+
+// backfillDeepSeekClaudeThinkingBlocks gives every assistant turn that replays a
+// tool call a thinking block. DeepSeek's Anthropic endpoint accepts a text-only
+// assistant turn without one, but rejects a thinking-mode tool turn whose
+// reasoning was not passed back. A thinking block is required to exist, not to
+// carry text or a signature, so a placeholder satisfies the check.
+func backfillDeepSeekClaudeThinkingBlocks(request *dto.ClaudeRequest) {
+	if request == nil || request.Thinking != nil && request.Thinking.Type == "disabled" {
+		return
+	}
+	for i := range request.Messages {
+		message := &request.Messages[i]
+		if message.Role != "assistant" {
+			continue
+		}
+		blocks, ok := message.Content.([]any)
+		if !ok {
+			continue
+		}
+		hasToolUse, hasThinking := false, false
+		for _, block := range blocks {
+			entry, ok := block.(map[string]any)
+			if !ok {
+				continue
+			}
+			switch entry["type"] {
+			case "tool_use":
+				hasToolUse = true
+			case "thinking", "redacted_thinking":
+				hasThinking = true
+			}
+		}
+		if hasToolUse && !hasThinking {
+			message.Content = append([]any{map[string]any{
+				"type":     "thinking",
+				"thinking": deepSeekReasoningPlaceholder,
+			}}, blocks...)
+		}
+	}
+}
+
+// backfillDeepSeekOpenAIReasoningContent is backfillDeepSeekClaudeThinkingBlocks
+// on the chat completions wire. Only reasoning_content satisfies DeepSeek;
+// a same-shaped reasoning field does not, so it is checked separately.
+func backfillDeepSeekOpenAIReasoningContent(request *dto.GeneralOpenAIRequest) {
+	if request == nil {
+		return
+	}
+	if len(request.THINKING) > 0 {
+		var thinking struct {
+			Type string `json:"type"`
+		}
+		if err := common.Unmarshal(request.THINKING, &thinking); err == nil && thinking.Type == "disabled" {
+			return
+		}
+	}
+	for i := range request.Messages {
+		message := &request.Messages[i]
+		if message.Role != "assistant" || len(message.ToolCalls) == 0 {
+			continue
+		}
+		if message.ReasoningContent != nil && strings.TrimSpace(*message.ReasoningContent) != "" {
+			continue
+		}
+		placeholder := deepSeekReasoningPlaceholder
+		message.ReasoningContent = &placeholder
+	}
+}
 
 // DeepSeek requires reasoning_text for assistant turns when thinking/tool use is
 // enabled. Mixed-provider histories may omit the entire reasoning item, not just
@@ -214,7 +286,7 @@ func backfillDeepSeekResponsesReasoningText(request *dto.OpenAIResponsesRequest)
 					placeholder, err := common.Marshal(map[string]any{
 						"type":    "reasoning",
 						"summary": []any{},
-						"content": []map[string]string{{"type": "reasoning_text", "text": deepSeekReasoningTextPlaceholder}},
+						"content": []map[string]string{{"type": "reasoning_text", "text": deepSeekReasoningPlaceholder}},
 					})
 					if err != nil {
 						return err
@@ -256,7 +328,7 @@ func backfillDeepSeekResponsesReasoningText(request *dto.OpenAIResponsesRequest)
 		}
 		text := strings.TrimSpace(builder.String())
 		if text == "" {
-			text = deepSeekReasoningTextPlaceholder
+			text = deepSeekReasoningPlaceholder
 		}
 		var item map[string]json.RawMessage
 		if err := common.Unmarshal(raw, &item); err != nil {

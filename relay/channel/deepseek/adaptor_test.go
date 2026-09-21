@@ -45,7 +45,7 @@ func TestBackfillDeepSeekResponsesReasoningText(t *testing.T) {
 	assert.Equal(t, []any{map[string]any{"type": "reasoning_text", "text": "real reasoning"}}, items[2]["content"])
 
 	// A reasoning item with nothing to recover still gets passable text.
-	assert.Equal(t, []any{map[string]any{"type": "reasoning_text", "text": deepSeekReasoningTextPlaceholder}}, items[3]["content"])
+	assert.Equal(t, []any{map[string]any{"type": "reasoning_text", "text": deepSeekReasoningPlaceholder}}, items[3]["content"])
 }
 
 func TestBackfillDeepSeekResponsesReasoningTextLeavesOtherPayloadsAlone(t *testing.T) {
@@ -130,6 +130,64 @@ func TestConvertDeepSeekResponsesRequestReasoningTurns(t *testing.T) {
 			again, err := (&Adaptor{}).ConvertOpenAIResponsesRequest(nil, nil, got)
 			require.NoError(t, err)
 			assert.Equal(t, got.Input, again.(dto.OpenAIResponsesRequest).Input, "conversion must be idempotent")
+		})
+	}
+}
+
+func TestBackfillDeepSeekClaudeThinkingBlocks(t *testing.T) {
+	const placeholder = `{"type":"thinking","thinking":"reasoning unavailable"}`
+	const toolUse = `{"type":"tool_use","id":"t1","name":"get_x","input":{}}`
+	cases := []struct {
+		name     string
+		thinking string
+		messages string
+		want     string
+	}{
+		{
+			name:     "tool use without thinking gets a placeholder",
+			messages: `[{"role":"user","content":"hi"},{"role":"assistant","content":[` + toolUse + `]}]`,
+			want:     `[{"role":"user","content":"hi"},{"role":"assistant","content":[` + placeholder + `,` + toolUse + `]}]`,
+		},
+		{
+			name:     "existing thinking is kept",
+			messages: `[{"role":"assistant","content":[{"type":"thinking","thinking":"real"},` + toolUse + `]}]`,
+			want:     `[{"role":"assistant","content":[{"type":"thinking","thinking":"real"},` + toolUse + `]}]`,
+		},
+		{
+			name:     "redacted_thinking counts as an echo",
+			messages: `[{"role":"assistant","content":[{"type":"redacted_thinking"},` + toolUse + `]}]`,
+			want:     `[{"role":"assistant","content":[{"type":"redacted_thinking"},` + toolUse + `]}]`,
+		},
+		{
+			name:     "a text-only turn wants no thinking block",
+			messages: `[{"role":"assistant","content":[{"type":"text","text":"done"}]}]`,
+			want:     `[{"role":"assistant","content":[{"type":"text","text":"done"}]}]`,
+		},
+		{
+			name:     "string content is untouched",
+			messages: `[{"role":"assistant","content":"done"}]`,
+			want:     `[{"role":"assistant","content":"done"}]`,
+		},
+		{
+			name:     "a user turn is never given thinking",
+			messages: `[{"role":"user","content":[` + toolUse + `]}]`,
+			want:     `[{"role":"user","content":[` + toolUse + `]}]`,
+		},
+		{
+			name:     "explicit disabled thinking leaves tool turns alone",
+			thinking: `"thinking":{"type":"disabled"},`,
+			messages: `[{"role":"assistant","content":[` + toolUse + `]}]`,
+			want:     `[{"role":"assistant","content":[` + toolUse + `]}]`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var request dto.ClaudeRequest
+			require.NoError(t, common.Unmarshal([]byte(`{`+tc.thinking+`"messages":`+tc.messages+`}`), &request))
+			backfillDeepSeekClaudeThinkingBlocks(&request)
+			got, err := common.Marshal(request.Messages)
+			require.NoError(t, err)
+			assert.JSONEq(t, tc.want, string(got))
 		})
 	}
 }
