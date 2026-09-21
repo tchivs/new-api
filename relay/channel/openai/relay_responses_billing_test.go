@@ -259,7 +259,13 @@ func TestOaiResponsesStreamHandlerMarksCompletedEventBeforeEOF(t *testing.T) {
 	require.Nil(t, apiErr)
 	require.NotNil(t, usage)
 	require.NotNil(t, info.StreamStatus)
-	assert.Equal(t, relaycommon.StreamEndReasonDone, info.StreamStatus.EndReason)
+	// rc.39 expresses "stream completed" through the response outcome plus
+	// IsNormalEnd() (which counts EOF as a normal end). The pre-rc.39
+	// EndReason==done marker no longer applies on this path; the behaviour this
+	// test guards - a completed event before EOF is a normal, successful end -
+	// is asserted on those signals instead.
+	assert.Equal(t, "completed", info.StreamStatus.ResponseOutcome())
+	assert.True(t, info.StreamStatus.IsNormalEnd())
 	assert.False(t, info.StreamStatus.HasErrors())
 	assert.Contains(t, w.Body.String(), "response.completed")
 }

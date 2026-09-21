@@ -86,22 +86,6 @@ func (s *StreamStatus) SetEndReason(reason StreamEndReason, err error) {
 	})
 }
 
-// MarkCompleted records an explicit protocol-level completion. A downstream
-// context can be canceled immediately after the final bytes are written, so
-// allow that late client_gone marker to be replaced by the stronger completion
-// signal from the stream handler.
-func (s *StreamStatus) MarkCompleted() {
-	if s == nil {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.EndReason == StreamEndReasonClientGone {
-		s.EndReason = StreamEndReasonDone
-		s.EndError = nil
-	}
-}
-
 func (s *StreamStatus) RecordError(msg string) {
 	if s == nil {
 		return
@@ -130,8 +114,21 @@ func (s *StreamStatus) RequireTerminal() {
 
 // MarkCompleted, MarkIncomplete and MarkCancelled keep the first terminal seen;
 // MarkFailed always wins because an error after completion is still a failure.
+//
+// A downstream context can be canceled immediately after the final bytes are
+// written, so a late client_gone EndReason is upgraded to done as well: the
+// explicit completion signal from the stream handler is the stronger one.
 func (s *StreamStatus) MarkCompleted() {
 	s.markTerminal(ResponseOutcomeCompleted, "")
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.EndReason == StreamEndReasonClientGone {
+		s.EndReason = StreamEndReasonDone
+		s.EndError = nil
+	}
 }
 
 func (s *StreamStatus) MarkIncomplete(reason string) {
