@@ -148,3 +148,59 @@ func TestImageModelBuiltinPricesAndOverrides(t *testing.T) {
 		})
 	}
 }
+
+func TestPublishedPriceBuiltinBilling(t *testing.T) {
+	settings := config.GlobalConfig.Get("billing_setting").(*billing_setting.BillingSetting)
+	saved := *settings
+	savedRatios, savedPrices := ratio_setting.ModelRatio2JSONString(), ratio_setting.ModelPrice2JSONString()
+	t.Cleanup(func() {
+		*settings = saved
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(savedRatios))
+		require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(savedPrices))
+	})
+	*settings = billing_setting.BillingSetting{BillingMode: map[string]string{}, BillingExpr: map[string]string{}}
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{}`))
+	require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{}`))
+
+	for _, tc := range []struct {
+		model              string
+		prompt, completion int
+		cached, written    int
+		tier               string
+		quota              int
+	}{
+		{"gpt-6-sol", 8, 4, 0, 0, "standard", 28},
+		{"gpt-6-sol", 272001, 4, 0, 0, "long_context", 544032},
+		{"gpt-6-luna", 8, 4, 0, 0, "standard", 1},
+		{"gpt-5.6-luna", 8, 4, 0, 0, "standard", 3},
+		{"gpt-5.6-luna", 272001, 4, 0, 0, "long_context", 54404},
+		{"gpt-5.6-sol", 1000, 10, 0, 0, "standard", 2100},
+		{"gpt-5.6-sol", 272001, 10, 0, 0, "long_context", 1088154},
+		{"gpt-5.6-terra", 1000, 10, 0, 0, "standard", 1060},
+		{"claude-opus-4-8", 8, 1, 0, 0, "standard", 33},
+		{"deepseek-v4-flash", 32, 16, 0, 0, "standard", 7},
+		{"deepseek-v4-flash", 117851, 1346, 115968, 0, "standard", 719},
+		{"deepseek-v4-pro", 1000, 100, 500, 0, "standard", 153},
+		{"qwen3.7-max", 1000, 10, 0, 0, "standard", 1288},
+		{"qwen3.7-plus", 1000, 10, 0, 0, "standard", 265},
+		{"qwen3.7-plus", 256001, 10, 0, 0, "long_context", 256031},
+		{"qwen3.8-flash", 1000, 10, 0, 0, "standard", 77},
+		{"glm-5.3-flash", 8, 4, 0, 0, "standard", 2},
+	} {
+		t.Run(tc.model, func(t *testing.T) {
+			expression, ok := billing_setting.GetBillingExpr(tc.model)
+			require.True(t, ok, "builtin expression missing for %s", tc.model)
+			assert.Equal(t, billing_setting.BillingModeTieredExpr, billing_setting.GetBillingMode(tc.model))
+			usage := &dto.Usage{
+				PromptTokens: tc.prompt, CompletionTokens: tc.completion,
+				PromptTokensDetails: dto.InputTokenDetails{CachedTokens: tc.cached, CacheWriteTokens: tc.written},
+			}
+			result, err := billingexpr.ComputeTieredQuota(
+				&billingexpr.BillingSnapshot{ExprString: expression, ExprHash: billingexpr.ExprHashString(expression), GroupRatio: 1, QuotaPerUnit: 500000},
+				service.BuildTieredTokenParams(usage, false, billingexpr.UsedVars(expression)))
+			require.NoError(t, err)
+			assert.Equal(t, tc.tier, result.MatchedTier)
+			assert.Equal(t, tc.quota, result.ActualQuotaAfterGroup)
+		})
+	}
+}
