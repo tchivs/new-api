@@ -676,6 +676,9 @@ func detectImageMimeType(filename string) string {
 }
 
 func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.OpenAIResponsesRequest) (any, error) {
+	if err := stripResponsesReasoningItemContent(&request); err != nil {
+		return nil, err
+	}
 	//  转换模型推理力度后缀
 	effort, originModel := reasoning.ParseOpenAIReasoningEffortFromModelSuffix(request.Model)
 	preserveSuffix := model_setting.ShouldPreserveThinkingSuffix(request.Model) || (info != nil && model_setting.ShouldPreserveThinkingSuffix(info.OriginModelName))
@@ -744,6 +747,51 @@ func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommo
 		}
 	}
 	return request, nil
+}
+
+// stripResponsesReasoningItemContent drops the plaintext content array from
+// replayed reasoning items. Upstream Responses schemas accept reasoning items in
+// input with summary/encrypted_content only and reject a populated content array
+// with array_above_max_length. Reasoning continuity travels through id and
+// encrypted_content, so the echoed item stays intact without its content.
+func stripResponsesReasoningItemContent(request *dto.OpenAIResponsesRequest) error {
+	if request == nil || !bytes.HasPrefix(bytes.TrimSpace(request.Input), []byte("[")) {
+		return nil
+	}
+	var items []json.RawMessage
+	if err := common.Unmarshal(request.Input, &items); err != nil {
+		return err
+	}
+	changed := false
+	for i, raw := range items {
+		var item map[string]json.RawMessage
+		if err := common.Unmarshal(raw, &item); err != nil {
+			return err
+		}
+		if string(bytes.TrimSpace(item["type"])) != `"reasoning"` {
+			continue
+		}
+		content := bytes.TrimSpace(item["content"])
+		if len(content) == 0 || bytes.Equal(content, []byte("null")) || bytes.Equal(content, []byte("[]")) {
+			continue
+		}
+		delete(item, "content")
+		encoded, err := common.Marshal(item)
+		if err != nil {
+			return err
+		}
+		items[i] = encoded
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+	encoded, err := common.Marshal(items)
+	if err != nil {
+		return err
+	}
+	request.Input = encoded
+	return nil
 }
 
 func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (any, error) {

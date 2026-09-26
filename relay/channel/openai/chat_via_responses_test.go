@@ -278,3 +278,40 @@ func requireOrderedSubstrings(t *testing.T, s string, parts ...string) {
 		offset += idx + len(part)
 	}
 }
+
+func TestStripResponsesReasoningItemContent(t *testing.T) {
+	const reasoningWithContent = `{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"blob","content":[{"type":"reasoning_text","text":"reasoning unavailable"}]}`
+
+	for _, tc := range []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "drops replayed reasoning content and keeps continuity fields",
+			input: `[{"role":"user","content":[{"type":"input_text","text":"hi"}]},` + reasoningWithContent + `]`,
+			want:  `[{"role":"user","content":[{"type":"input_text","text":"hi"}]},{"encrypted_content":"blob","id":"rs_1","summary":[],"type":"reasoning"}]`,
+		},
+		{
+			name:  "leaves reasoning items without content untouched",
+			input: `[{"type":"reasoning","summary":[],"content":[]},{"type":"reasoning","summary":[]}]`,
+			want:  `[{"type":"reasoning","summary":[],"content":[]},{"type":"reasoning","summary":[]}]`,
+		},
+		{
+			name:  "leaves non-reasoning items untouched",
+			input: `[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}]`,
+			want:  `[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}]`,
+		},
+		{
+			name:  "leaves plain string input untouched",
+			input: `"hello"`,
+			want:  `"hello"`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			request := dto.OpenAIResponsesRequest{Input: []byte(tc.input)}
+			require.NoError(t, stripResponsesReasoningItemContent(&request))
+			assert.JSONEq(t, tc.want, string(request.Input))
+		})
+	}
+}
