@@ -232,3 +232,39 @@ func TestGetTokenAutoGroupsReturnsFullFilteredGlobalOrderAndLimit(t *testing.T) 
 	assert.Equal(t, []string{"vip", "default"}, data.Groups)
 	assert.Equal(t, 1, data.MaxCount)
 }
+
+func TestTokenGroupMustBeUserSelectable(t *testing.T) {
+	tests := []struct {
+		name    string
+		group   string
+		allowed bool
+	}{
+		{name: "usable group", group: "vip", allowed: true},
+		{name: "empty inherits user group", group: "", allowed: true},
+		{name: "group outside usable list", group: "claude", allowed: false},
+		{name: "unknown group", group: "svip", allowed: false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			configureTokenAutoGroupsTest(t, "5", `["default","vip"]`)
+			user := setupTokenAutoGroupsControllerTest(t)
+			request := baseAutoTokenRequest("group-" + test.name)
+			request["group"] = test.group
+
+			ctx, recorder := newTokenAutoGroupsAuthenticatedContext(t, http.MethodPost, "/api/token/", request, user.Id)
+			AddToken(ctx)
+
+			response := decodeAPIResponse(t, recorder)
+			require.Equal(t, test.allowed, response.Success, response.Message)
+			var token model.Token
+			err := model.DB.Where("name = ?", request["name"]).First(&token).Error
+			if !test.allowed {
+				assert.Error(t, err, "unauthorized group must not be persisted")
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, test.group, token.Group)
+		})
+	}
+}

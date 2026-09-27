@@ -185,6 +185,24 @@ func GetTokenAutoGroups(c *gin.Context) {
 	})
 }
 
+// ensureSelectableTokenGroup 校验令牌请求的分组属于该用户可选分组。
+// 空分组沿用用户自身分组，auto 分组由 setTokenAutoGroups 单独校验。
+func ensureSelectableTokenGroup(c *gin.Context, group string) bool {
+	if group == "" || group == "auto" {
+		return true
+	}
+	userGroup, err := getTokenRequestUserGroup(c)
+	if err != nil {
+		common.ApiError(c, err)
+		return false
+	}
+	if !service.IsUserSelectableGroup(userGroup, group) {
+		common.ApiErrorI18n(c, i18n.MsgTokenGroupInvalid, map[string]any{"Group": group})
+		return false
+	}
+	return true
+}
+
 func GetTokenKey(c *gin.Context) {
 	id, err := strconv.Atoi(c.Param("id"))
 	userId := c.GetInt("id")
@@ -320,6 +338,9 @@ func AddToken(c *gin.Context) {
 			return
 		}
 	} else {
+		if !ensureSelectableTokenGroup(c, token.Group) {
+			return
+		}
 		token.CrossGroupRetry = false
 		_ = token.SetAutoGroups(nil)
 	}
@@ -437,6 +458,9 @@ func UpdateToken(c *gin.Context) {
 		cleanToken.ModelLimitsEnabled = token.ModelLimitsEnabled
 		cleanToken.ModelLimits = token.ModelLimits
 		cleanToken.AllowIps = token.AllowIps
+		if token.Group != cleanToken.Group && !ensureSelectableTokenGroup(c, token.Group) {
+			return
+		}
 		cleanToken.Group = token.Group
 		cleanToken.CrossGroupRetry = token.CrossGroupRetry
 		if token.Group != "auto" {
