@@ -1,12 +1,15 @@
 package model
 
 import (
+	"os"
+	"strings"
 	"testing"
 
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 	"gorm.io/gorm/utils/tests"
 )
 
@@ -164,5 +167,108 @@ func TestTaskPluginOrderSQLQuotesMySQLKeyColumn(t *testing.T) {
 	for _, sql := range sqls {
 		assert.Contains(t, sql, "`key`")
 		assert.NotRegexp(t, `(?i)ORDER BY[[:space:]]+key([[:space:],]|$)`, sql)
+	}
+}
+
+type priorTaskPlugin struct {
+	Id         int64
+	Key        string `gorm:"size:128;not null;uniqueIndex:uk_task_plugin_key_version,priority:1"`
+	APIVersion int    `gorm:"not null"`
+	Version    string `gorm:"size:64;not null;uniqueIndex:uk_task_plugin_key_version,priority:2"`
+	Source     string `gorm:"type:text;not null"`
+	SourceHash string `gorm:"size:64;not null"`
+	Icon       string `gorm:"size:524288"`
+	Enabled    bool   `gorm:"not null"`
+	Active     bool   `gorm:"not null;index"`
+	CreatedAt  int64  `gorm:"not null"`
+	Remark     string `gorm:"type:text"`
+}
+
+func (priorTaskPlugin) TableName() string { return "task_plugins" }
+func TestTaskPluginLongTextMigration(t *testing.T) {
+
+	for _, dialect := range []struct {
+		name, env string
+	}{
+		{name: "sqlite"},
+		{name: "mysql", env: "TEST_MYSQL_DSN"},
+		{name: "postgres", env: "TEST_POSTGRES_DSN"},
+	} {
+		t.Run(dialect.name, func(t *testing.T) {
+			var db *gorm.DB
+			var err error
+			if dialect.env == "" {
+				db, err = gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+			} else {
+				if os.Getenv(dialect.env) == "" {
+					t.Skip(dialect.env + " is not configured")
+				}
+				db, _, err = chooseDB(dialect.env, false)
+			}
+			require.NoError(t, err)
+			sqlDB, err := db.DB()
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
+			t.Cleanup(func() { require.NoError(t, db.Migrator().DropTable(&TaskPlugin{})) })
+			originalDB := DB
+			DB = db
+			t.Cleanup(func() { DB = originalDB })
+
+			for _, upgrade := range []bool{true, false} {
+				require.NoError(t, db.Migrator().DropTable(&TaskPlugin{}))
+				if upgrade {
+					require.NoError(t, db.AutoMigrate(&priorTaskPlugin{}))
+					prior := priorTaskPlugin{Key: "fixture", APIVersion: 1, Version: "1.0.0", Source: "prior source", SourceHash: "prior-hash", Icon: "prior icon", Enabled: true, Active: true, CreatedAt: 1}
+					require.NoError(t, db.Create(&prior).Error)
+				}
+				for range 2 {
+					require.NoError(t, db.AutoMigrate(&TaskPlugin{}))
+				}
+				require.True(t, db.Migrator().HasIndex(&TaskPlugin{}, "uk_task_plugin_key_version"))
+				columns, err := db.Migrator().ColumnTypes(&TaskPlugin{})
+				require.NoError(t, err)
+				wantType := "text"
+				if dialect.name == "mysql" {
+					wantType = "longtext"
+				}
+				for _, column := range columns {
+					if column.Name() == "source" || column.Name() == "icon" {
+						assert.Equal(t, wantType, strings.ToLower(column.DatabaseTypeName()), column.Name())
+					}
+				}
+				if upgrade {
+					var prior TaskPlugin
+					require.NoError(t, db.Where(&TaskPlugin{Key: "fixture"}).First(&prior).Error)
+					assert.Equal(t, LongText("prior source"), prior.Source)
+					assert.Equal(t, LongText("prior icon"), prior.Icon)
+					assert.True(t, prior.Active)
+					assert.True(t, prior.Enabled)
+					assert.Equal(t, "prior-hash", prior.SourceHash)
+				}
+				source := strings.Repeat("x", 100_000)
+				row := TaskPlugin{Key: "large", APIVersion: 1, Version: "1.0.0", Source: LongText(source), SourceHash: "large-hash", Icon: LongText(source), Enabled: true, Active: true}
+				require.NoError(t, db.Create(&row).Error)
+				var stored TaskPlugin
+				require.NoError(t, db.First(&stored, row.Id).Error)
+				assert.Equal(t, row.Source, stored.Source)
+				assert.Equal(t, row.Icon, stored.Icon)
+				snapshot, err := GetTaskPluginSyncSnapshot()
+				require.NoError(t, err)
+				wantPlugins := 1
+				if upgrade {
+					wantPlugins++
+				}
+				require.Len(t, snapshot.Plugins, wantPlugins)
+				for _, plugin := range snapshot.Plugins {
+					assert.Empty(t, plugin.Source)
+					assert.Empty(t, plugin.Icon)
+				}
+				loaded, err := GetTaskPluginSource(row.Id)
+				require.NoError(t, err)
+				assert.Equal(t, row.Source, loaded)
+				duplicate := TaskPlugin{Key: "large", APIVersion: 1, Version: "1.0.0", Source: "duplicate", SourceHash: "other"}
+				require.Error(t, db.Session(&gorm.Session{Logger: logger.Default.LogMode(logger.Silent)}).Create(&duplicate).Error)
+			}
+		})
 	}
 }
