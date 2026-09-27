@@ -297,7 +297,7 @@ func ResolveHeaderOverride(info *common.RelayInfo, c *gin.Context) (map[string]s
 	return processHeaderOverride(info, c)
 }
 
-func applyHeaderOverrideToRequest(req *http.Request, headerOverride map[string]string) {
+func applyHeaderOverrideToRequest(req *http.Request, headerOverride map[string]string, info *common.RelayInfo) {
 	if req == nil {
 		return
 	}
@@ -306,6 +306,14 @@ func applyHeaderOverrideToRequest(req *http.Request, headerOverride map[string]s
 		// set Host in req
 		if strings.EqualFold(key, "Host") {
 			req.Host = value
+		}
+	}
+	if info != nil && info.ChannelOtherSettings.StripUnsupportedBeta {
+		filtered := common.FilterBedrockAnthropicBeta(req.Header.Get("anthropic-beta"))
+		if filtered == "" {
+			req.Header.Del("anthropic-beta")
+		} else {
+			req.Header.Set("anthropic-beta", filtered)
 		}
 	}
 }
@@ -332,7 +340,7 @@ func DoApiRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 	if err != nil {
 		return nil, err
 	}
-	applyHeaderOverrideToRequest(req, headerOverride)
+	applyHeaderOverrideToRequest(req, headerOverride, info)
 	resp, err := doRequest(c, req, info)
 	if err != nil {
 		return nil, fmt.Errorf("do request failed: %w", err)
@@ -364,7 +372,7 @@ func DoFormRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBod
 	if err != nil {
 		return nil, err
 	}
-	applyHeaderOverrideToRequest(req, headerOverride)
+	applyHeaderOverrideToRequest(req, headerOverride, info)
 	resp, err := doRequest(c, req, info)
 	if err != nil {
 		return nil, fmt.Errorf("do request failed: %w", err)

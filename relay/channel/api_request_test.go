@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -201,10 +202,42 @@ func TestProcessHeaderOverride_PassHeadersTemplateSetsRuntimeHeaders(t *testing.
 	require.False(t, exists)
 
 	upstreamReq := httptest.NewRequest(http.MethodPost, "https://example.com/v1/responses", nil)
-	applyHeaderOverrideToRequest(upstreamReq, headers)
+	applyHeaderOverrideToRequest(upstreamReq, headers, info)
 	require.Equal(t, "Codex CLI", upstreamReq.Header.Get("Originator"))
 	require.Equal(t, "sess-123", upstreamReq.Header.Get("Session_id"))
 	require.Empty(t, upstreamReq.Header.Get("X-Codex-Beta-Features"))
+}
+
+func TestApplyHeaderOverrideToRequestFiltersBedrockBetaLast(t *testing.T) {
+	const mixedBeta = "oauth-2025-04-20,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05"
+	for _, tc := range []struct {
+		name  string
+		strip bool
+		beta  string
+		want  string
+	}{
+		{name: "Bedrock proxy keeps supported flag", strip: true, beta: mixedBeta, want: "interleaved-thinking-2025-05-14"},
+		{name: "Bedrock proxy drops unsupported-only header", strip: true, beta: "oauth-2025-04-20"},
+		{name: "regular Claude channel preserves beta", beta: mixedBeta, want: mixedBeta},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{
+				ChannelOtherSettings: dto.ChannelOtherSettings{StripUnsupportedBeta: tc.strip},
+			}}
+			request := httptest.NewRequest(http.MethodPost, "https://example.com/v1/messages", nil)
+			request.Header.Set("anthropic-beta", "interleaved-thinking-2025-05-14")
+			applyHeaderOverrideToRequest(request, map[string]string{
+				"anthropic-beta": tc.beta,
+				"x-trace-id":     "trace-123",
+			}, info)
+			if tc.want == "" {
+				assert.NotContains(t, request.Header, "Anthropic-Beta")
+			} else {
+				assert.Equal(t, tc.want, request.Header.Get("anthropic-beta"))
+			}
+			assert.Equal(t, "trace-123", request.Header.Get("x-trace-id"))
+		})
+	}
 }
 
 func TestToWebSocketURL(t *testing.T) {
