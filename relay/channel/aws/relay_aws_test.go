@@ -141,7 +141,7 @@ func newAwsStreamResponse(request *http.Request, body io.ReadCloser) *http.Respo
 	}
 }
 
-func TestDoAwsClientRequest_AppliesRuntimeHeaderOverrideToAnthropicBeta(t *testing.T) {
+func TestDoAwsClientRequestDropsUnsupportedRuntimeBeta(t *testing.T) {
 	t.Parallel()
 
 	gin.SetMode(gin.TestMode)
@@ -174,12 +174,63 @@ func TestDoAwsClientRequest_AppliesRuntimeHeaderOverrideToAnthropicBeta(t *testi
 	var payload map[string]any
 	require.NoError(t, common.Unmarshal(awsReq.Body, &payload))
 
-	anthropicBeta, exists := payload["anthropic_beta"]
-	require.True(t, exists)
+	assert.NotContains(t, payload, "anthropic_beta")
+}
 
-	values, ok := anthropicBeta.([]any)
-	require.True(t, ok)
-	require.Equal(t, []any{"computer-use-2025-01-24"}, values)
+func TestDoAwsClientRequestFiltersUnsupportedBetaWithoutChannelOption(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const body = `{"model":"claude-3-5-sonnet-20240620","messages":[{"role":"user","content":"hello"}],"max_tokens":128,"anthropic_beta":["oauth-2025-04-20"]}`
+	const beta = "mid-conversation-system-2026-04-07,oauth-2025-04-20,prompt-caching-scope-2026-01-05,thinking-token-count-2026-05-13,interleaved-thinking-2025-05-14"
+
+	for _, tc := range []struct {
+		name        string
+		stream      bool
+		passthrough bool
+		override    bool
+	}{
+		{name: "stream with runtime header override", stream: true, override: true},
+		{name: "non-stream with client header"},
+		{name: "stream passthrough body", stream: true, passthrough: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewBufferString(body))
+			defer common.CleanupBodyStorage(ctx)
+			info := newAwsTestRelayInfo()
+			info.ChannelMeta.ApiKey = "access-key|secret-key|us-east-1"
+			info.IsStream = tc.stream
+			info.ChannelMeta.ChannelSetting.PassThroughBodyEnabled = tc.passthrough
+			if tc.override {
+				ctx.Request.Header.Set("anthropic-beta", "interleaved-thinking-2025-05-14")
+				info.UseRuntimeHeadersOverride = true
+				info.RuntimeHeadersOverride = map[string]any{"anthropic-beta": beta}
+			} else {
+				ctx.Request.Header.Set("anthropic-beta", beta)
+			}
+
+			adaptor := &Adaptor{}
+			_, err := doAwsClientRequest(ctx, info, adaptor, bytes.NewBufferString(body))
+			require.NoError(t, err)
+
+			var outboundBody []byte
+			if tc.stream {
+				request, ok := adaptor.AwsReq.(*bedrockruntime.InvokeModelWithResponseStreamInput)
+				require.True(t, ok)
+				outboundBody = request.Body
+			} else {
+				request, ok := adaptor.AwsReq.(*bedrockruntime.InvokeModelInput)
+				require.True(t, ok)
+				outboundBody = request.Body
+			}
+			var payload map[string]any
+			require.NoError(t, common.Unmarshal(outboundBody, &payload))
+			if tc.passthrough {
+				assert.NotContains(t, payload, "anthropic_beta")
+			} else {
+				assert.Equal(t, []any{"interleaved-thinking-2025-05-14"}, payload["anthropic_beta"])
+			}
+		})
+	}
 }
 
 func TestNewAwsInvokeContextInheritsParent(t *testing.T) {
