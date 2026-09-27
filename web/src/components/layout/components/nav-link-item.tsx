@@ -74,11 +74,18 @@ export function NavLinkList({
   className,
   itemClassName,
 }: NavLinkListProps) {
+  const keyCounts = new Map<string, number>()
+  const keyForLink = (link: TopNavLink) => {
+    const identity = JSON.stringify([link.href, link.title])
+    const occurrence = keyCounts.get(identity) ?? 0
+    keyCounts.set(identity, occurrence + 1)
+    return `${identity}-${occurrence}`
+  }
   return (
     <>
-      {links.map((link, index) => (
+      {links.map((link) => (
         <NavLinkItem
-          key={index}
+          key={keyForLink(link)}
           link={link}
           className={cn(className, itemClassName)}
         />

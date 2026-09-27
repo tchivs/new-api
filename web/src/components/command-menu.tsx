@@ -49,6 +49,13 @@ export function CommandMenu() {
   // Use the active nested sidebar view's nav groups when one matches
   // the current URL; otherwise fall back to the root navigation.
   const navGroups = getNavGroupsForPath(pathname, t) ?? sidebarData.navGroups
+  const itemKeyCounts = new Map<string, number>()
+  const itemKey = (parts: string[]) => {
+    const identity = JSON.stringify(parts)
+    const occurrence = itemKeyCounts.get(identity) ?? 0
+    itemKeyCounts.set(identity, occurrence + 1)
+    return `${identity}-${occurrence}`
+  }
 
   const runCommand = React.useCallback(
     (command: () => unknown) => {
@@ -67,11 +74,11 @@ export function CommandMenu() {
             <CommandEmpty>{t('No results found.')}</CommandEmpty>
             {navGroups.map((group) => (
               <CommandGroup key={group.id || group.title} heading={group.title}>
-                {group.items.map((navItem, i) => {
-                  if (navItem.url)
+                {group.items.map((navItem) => {
+                  if (navItem.url) {
                     return (
                       <CommandItem
-                        key={`${navItem.url}-${i}`}
+                        key={itemKey([navItem.title, navItem.url])}
                         value={navItem.title}
                         onSelect={() => {
                           runCommand(() => navigate({ to: navItem.url }))
@@ -83,10 +90,15 @@ export function CommandMenu() {
                         {navItem.title}
                       </CommandItem>
                     )
+                  }
 
-                  return navItem.items?.map((subItem, i) => (
+                  return navItem.items?.map((subItem) => (
                     <CommandItem
-                      key={`${navItem.title}-${subItem.url}-${i}`}
+                      key={itemKey([
+                        navItem.title,
+                        subItem.title,
+                        subItem.url ?? '',
+                      ])}
                       value={`${navItem.title}-${subItem.url}`}
                       onSelect={() => {
                         runCommand(() => navigate({ to: subItem.url }))

@@ -48,15 +48,22 @@ export function PublicNavigation({
   const dynamicLinks = useTopNavLinks()
   const defaultLinks = providedLinks || defaultTopNavLinks
   const links = dynamicLinks.length > 0 ? dynamicLinks : defaultLinks
+  const keyCounts = new Map<string, number>()
+  const keyForLink = (link: TopNavLink) => {
+    const identity = JSON.stringify([link.href, link.title])
+    const occurrence = keyCounts.get(identity) ?? 0
+    keyCounts.set(identity, occurrence + 1)
+    return `${identity}-${occurrence}`
+  }
 
   return (
     <nav className={cn('hidden items-center gap-1 md:flex', className)}>
-      {links.map((link, index) => {
+      {links.map((link) => {
         // Handle external links
         if (link.external) {
           return (
             <a
-              key={index}
+              key={keyForLink(link)}
               href={link.href}
               target='_blank'
               rel='noopener noreferrer'
@@ -72,7 +79,7 @@ export function PublicNavigation({
         // Handle internal links
         return (
           <Link
-            key={index}
+            key={keyForLink(link)}
             to={link.href}
             className={cn(
               'text-muted-foreground hover:bg-accent hover:text-accent-foreground focus:bg-accent focus:text-accent-foreground inline-flex h-9 w-max items-center justify-center rounded-md bg-transparent px-4 py-2 text-sm font-medium transition-colors focus:outline-none',
