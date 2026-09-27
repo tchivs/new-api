@@ -268,3 +268,39 @@ func TestTokenGroupMustBeUserSelectable(t *testing.T) {
 		})
 	}
 }
+
+func TestUpdateTokenGroupMustBeUserSelectable(t *testing.T) {
+	for _, test := range []struct {
+		group   string
+		allowed bool
+	}{
+		{group: "vip", allowed: true},
+		{group: "claude", allowed: false},
+	} {
+		t.Run(test.group, func(t *testing.T) {
+			configureTokenAutoGroupsTest(t, "5", `["default","vip"]`)
+			user := setupTokenAutoGroupsControllerTest(t)
+			token := seedToken(t, model.DB, user.Id, "before-update", "update-group-key")
+			token.Group = "default"
+			require.NoError(t, model.DB.Save(token).Error)
+
+			request := baseAutoTokenRequest("after-update")
+			request["id"] = token.Id
+			request["status"] = common.TokenStatusEnabled
+			request["group"] = test.group
+			ctx, recorder := newTokenAutoGroupsAuthenticatedContext(t, http.MethodPut, "/api/token/", request, user.Id)
+			UpdateToken(ctx)
+			assert.Equal(t, test.allowed, decodeAPIResponse(t, recorder).Success)
+
+			var updated model.Token
+			require.NoError(t, model.DB.First(&updated, token.Id).Error)
+			if test.allowed {
+				assert.Equal(t, test.group, updated.Group)
+				assert.Equal(t, "after-update", updated.Name)
+			} else {
+				assert.Equal(t, "default", updated.Group)
+				assert.Equal(t, "before-update", updated.Name)
+			}
+		})
+	}
+}
