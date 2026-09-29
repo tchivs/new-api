@@ -270,6 +270,41 @@ func TestOaiResponsesStreamHandlerMarksCompletedEventBeforeEOF(t *testing.T) {
 	assert.Contains(t, w.Body.String(), "response.completed")
 }
 
+func TestOaiResponsesStreamHandlerReportsMissingTerminal(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	info := &relaycommon.RelayInfo{
+		IsStream:    true,
+		DisablePing: true,
+		ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "deepseek-v4-flash"},
+	}
+	info.SetEstimatePromptTokens(42)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body: io.NopCloser(strings.NewReader(
+			"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_early\",\"status\":\"in_progress\"}}\n\n")),
+		Header: http.Header{"Content-Type": []string{"text/event-stream"}},
+	}
+
+	usage, apiErr := OaiResponsesStreamHandler(c, info, resp)
+	require.Nil(t, apiErr)
+	require.NotNil(t, usage)
+	assert.Equal(t, 0, usage.PromptTokens)
+	assert.Equal(t, relaycommon.StreamEndReasonEOF, info.StreamStatus.EndReason)
+	assert.Equal(t, "failed", info.StreamStatus.ResponseOutcome())
+	assert.True(t, info.StreamStatus.HasErrors())
+	assert.Contains(t, w.Body.String(), "event: response.failed")
+	assert.Contains(t, w.Body.String(), `"id":"resp_early"`)
+	assert.Contains(t, w.Body.String(), `"code":"upstream_stream_incomplete"`)
+	assert.NotContains(t, w.Body.String(), "event: response.completed")
+}
+
 func TestOaiResponsesStreamHandlerDeduplicatesCompletedImageOutput(t *testing.T) {
 	item := `{"type":"image_generation_call","id":"img_1","call_id":"call_1","status":"completed","result":"base64-a"}`
 	info := runResponsesImageBillingStream(

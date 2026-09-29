@@ -78,6 +78,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	defer service.CloseResponseBodyGracefully(resp)
 
 	accumulator := service.NewResponsesUsageAccumulator(info)
+	responseID := helper.GetResponseID(c)
 
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 
@@ -91,12 +92,43 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		if streamResponse.Response != nil {
 			data = string(rewriteSGLangResponsesCreatedAt(info, []byte(data), "response.created_at", streamResponse.Response.CreatedAt))
 		}
+		if streamResponse.Response != nil && streamResponse.Response.ID != "" {
+			responseID = streamResponse.Response.ID
+		}
 		sendResponsesStreamData(c, streamResponse, data)
 		accumulator.Observe(&streamResponse)
 	})
 
 	common.SetContextKey(c, constant.ContextKeyResponseStreamStatus, info.StreamStatus)
 	info.StreamStatus.RequireTerminal()
+	outcome := info.StreamStatus.OutcomeSnapshot()
+	if outcome.Response == relaycommon.ResponseOutcomeUnknown &&
+		outcome.EndReason != relaycommon.StreamEndReasonClientGone &&
+		outcome.EndReason != relaycommon.StreamEndReasonHandlerStop &&
+		c.Request.Context().Err() == nil {
+		const message = "upstream Responses stream ended before a terminal event"
+		info.StreamStatus.MarkFailed("upstream_stream_incomplete", "server_error", http.StatusBadGateway)
+		info.StreamStatus.RecordError(message)
+		failure := dto.ResponsesStreamResponse{
+			Type: "response.failed",
+			Response: &dto.OpenAIResponsesResponse{
+				ID:        responseID,
+				Object:    "response",
+				CreatedAt: dto.IntValue(common.GetTimestamp()),
+				Model:     info.GetUpstreamModelName(),
+				Status:    []byte(`"failed"`),
+				Error: map[string]any{
+					"code":    "upstream_stream_incomplete",
+					"message": message,
+				},
+			},
+		}
+		if payload, err := common.Marshal(failure); err != nil {
+			logger.LogError(c, "failed to marshal Responses stream failure: "+err.Error())
+		} else if err := helper.ResponseChunkData(c, failure, string(payload)); err != nil {
+			logger.LogError(c, "failed to send Responses stream failure: "+err.Error())
+		}
+	}
 	return accumulator.Finish(), nil
 }
 
