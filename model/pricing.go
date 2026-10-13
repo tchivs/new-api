@@ -1,7 +1,8 @@
 package model
 
 import (
-	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -112,10 +113,12 @@ func GetModelSupportEndpointTypes(model string) []constant.EndpointType {
 	if model == "" {
 		return make([]constant.EndpointType, 0)
 	}
+	// Refresh before taking the read lock; rebuilding needs the write lock.
+	GetPricing()
 	modelSupportEndpointsLock.RLock()
 	defer modelSupportEndpointsLock.RUnlock()
 	if endpoints, ok := modelSupportEndpointTypes[model]; ok {
-		return endpoints
+		return slices.Clone(endpoints)
 	}
 	return make([]constant.EndpointType, 0)
 }
@@ -170,7 +173,7 @@ func loadPricingAdvancedCustomConfigs(enableAbilities []AbilityWithChannel) map[
 	for _, channelID := range channelIDs {
 		channel, err := CacheGetChannel(channelID)
 		if err != nil {
-			common.SysLog(fmt.Sprintf("load advanced custom channel settings error: channel_id=%d, error=%v", channelID, err))
+			common.SysLog(common.LogText("load advanced custom channel settings error: channel_id=%d, error=%v", channelID, err))
 			continue
 		}
 		if channel.Type != constant.ChannelTypeAdvancedCustom {
@@ -194,7 +197,7 @@ func updatePricing() {
 	//modelRatios := common.GetModelRatios()
 	enableAbilities, err := GetAllEnableAbilityWithChannels()
 	if err != nil {
-		common.SysLog(fmt.Sprintf("GetAllEnableAbilityWithChannels error: %v", err))
+		common.SysLog(common.LogText("GetAllEnableAbilityWithChannels error: %v", err))
 		return
 	}
 	// 预加载模型元数据与供应商一次，避免循环查询
@@ -260,13 +263,22 @@ func updatePricing() {
 		if strings.TrimSpace(meta.Endpoints) == "" {
 			continue
 		}
-		var raw map[string]any
-		if err := common.Unmarshal([]byte(meta.Endpoints), &raw); err == nil {
+		var raw any
+		if err := common.UnmarshalJsonStr(meta.Endpoints, &raw); err == nil {
 			endpoints := modelSupportEndpointsStr[modelName]
-			for k, v := range raw {
-				switch v.(type) {
-				case string, map[string]any:
-					endpoints = appendPricingEndpoint(endpoints, k)
+			switch declared := raw.(type) {
+			case []any:
+				for _, value := range declared {
+					if endpoint, ok := value.(string); ok {
+						endpoints = appendPricingEndpoint(endpoints, endpoint)
+					}
+				}
+			case map[string]any:
+				for k, v := range declared {
+					switch v.(type) {
+					case string, map[string]any:
+						endpoints = appendPricingEndpoint(endpoints, k)
+					}
 				}
 			}
 			if len(endpoints) > 0 {
@@ -449,5 +461,8 @@ func updatePricing() {
 
 // GetSupportedEndpointMap 返回全局端点到路径的映射
 func GetSupportedEndpointMap() map[string]common.EndpointInfo {
-	return supportedEndpointMap
+	GetPricing()
+	modelSupportEndpointsLock.RLock()
+	defer modelSupportEndpointsLock.RUnlock()
+	return maps.Clone(supportedEndpointMap)
 }

@@ -8,6 +8,7 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
+	"github.com/QuantumNous/new-api/tokenkit"
 )
 
 // ResponsesUsageAccumulator owns the accounting facts for one Responses stream.
@@ -28,7 +29,9 @@ func NewResponsesUsageAccumulator(info *relaycommon.RelayInfo) *ResponsesUsageAc
 	return &ResponsesUsageAccumulator{info: info, usage: &dto.Usage{}}
 }
 
-func (a *ResponsesUsageAccumulator) Observe(event *dto.ResponsesStreamResponse) {
+// Observe feeds one decoded stream event. raw is the same event's wire bytes;
+// the vendor tool-usage reader runs on it once, at the terminal event.
+func (a *ResponsesUsageAccumulator) Observe(event *dto.ResponsesStreamResponse, raw []byte) {
 	if a == nil || event == nil || a.finished {
 		return
 	}
@@ -46,9 +49,13 @@ func (a *ResponsesUsageAccumulator) Observe(event *dto.ResponsesStreamResponse) 
 				a.outputText.WriteString(relayconvert.ExtractOutputTextFromResponses(event.Response))
 			}
 		}
+		// Vendor counts are cumulative on the terminal event and replace the
+		// web_search_call items counted from output_item.done.
+		a.info.ApplyVendorToolUsage(raw)
 		if a.imageCommitted {
 			return
 		}
+		// Preserve the fork billing contract: failed terminals bill no images.
 		failed := event.Type != "response.completed" && event.Type != "response.done"
 		if failed || (event.Response != nil && relaycommon.IsNonBillableResponsesStatus(event.Response.Status)) {
 			a.imageCounter.Reset()
@@ -84,16 +91,15 @@ func (a *ResponsesUsageAccumulator) Finish() *dto.Usage {
 		return a.usage
 	}
 	a.finished = true
-	// A final image item can already have reached the client before the stream
-	// disconnects. Explicit failed/incomplete terminals reset and commit zero in
-	// Observe; otherwise retain completed tool usage even without a terminal.
+	// Completed images survive disconnects without a terminal, but explicit
+	// failed/incomplete terminals already reset and commit zero in Observe.
 	if !a.imageCommitted {
 		a.imageCounter.Commit(a.info)
 		a.imageCommitted = true
 	}
 	if a.usage.CompletionTokens == 0 {
 		if output := a.outputText.String(); output != "" {
-			a.usage.CompletionTokens = CountTextToken(output, a.info.GetUpstreamModelName())
+			a.usage.CompletionTokens = tokenkit.Count(a.info.GetUpstreamModelName(), output)
 		}
 	}
 	// Upstream bills the prompt as soon as it starts generating, so a stream

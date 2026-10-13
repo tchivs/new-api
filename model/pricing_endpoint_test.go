@@ -136,6 +136,114 @@ func TestPricingModelMetadataEndpointsMergeWithAdvancedCustomInference(t *testin
 	}, byModel["gemini-2.5-flash"])
 }
 
+func TestGetModelSupportEndpointTypesMergesMetadataDeclarations(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		endpoints string
+		want      []constant.EndpointType
+		paths     map[string]common.EndpointInfo
+	}{
+		{
+			name:      "array appends and deduplicates without trimming inference",
+			endpoints: `["anthropic","openai-response","anthropic","openai-response"]`,
+			want:      []constant.EndpointType{constant.EndpointTypeOpenAI, constant.EndpointTypeAnthropic, constant.EndpointTypeOpenAIResponse},
+			paths: map[string]common.EndpointInfo{
+				"anthropic":       {Path: "/v1/messages", Method: "POST"},
+				"openai-response": {Path: "/v1/responses", Method: "POST"},
+			},
+		},
+		{
+			name:      "array deduplicates inferred protocol",
+			endpoints: `["openai","openai","anthropic"]`,
+			want:      []constant.EndpointType{constant.EndpointTypeOpenAI, constant.EndpointTypeAnthropic},
+		},
+		{
+			name:      "string path remains a custom path",
+			endpoints: `{"anthropic":"/custom/messages"}`,
+			want:      []constant.EndpointType{constant.EndpointTypeOpenAI, constant.EndpointTypeAnthropic},
+			paths: map[string]common.EndpointInfo{
+				"anthropic": {Path: "/custom/messages", Method: "POST"},
+			},
+		},
+		{
+			name:      "object path retains method",
+			endpoints: `{"openai-response":{"path":"/custom/responses","method":"PUT"}}`,
+			want:      []constant.EndpointType{constant.EndpointTypeOpenAI, constant.EndpointTypeOpenAIResponse},
+			paths: map[string]common.EndpointInfo{
+				"openai-response": {Path: "/custom/responses", Method: "PUT"},
+			},
+		},
+		{
+			name:      "empty declaration does not advertise extra protocols",
+			endpoints: `[]`,
+			want:      []constant.EndpointType{constant.EndpointTypeOpenAI},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resetPricingEndpointTestTables(t)
+			require.NoError(t, ValidateModelEndpoints(tc.endpoints))
+			insertPricingEndpointChannel(t, 105, constant.ChannelTypeOpenAI, dto.ChannelOtherSettings{})
+			insertPricingEndpointAbility(t, 105, "catalogue-model")
+			require.NoError(t, DB.Create(&Model{
+				ModelName: "catalogue-model",
+				Endpoints: tc.endpoints,
+				Status:    1,
+				NameRule:  NameRuleExact,
+			}).Error)
+
+			InitChannelCache()
+			assert.Equal(t, tc.want, GetModelSupportEndpointTypes("catalogue-model"))
+			for endpoint, path := range tc.paths {
+				assert.Equal(t, path, GetSupportedEndpointMap()[endpoint])
+			}
+		})
+	}
+}
+
+func TestPricingEndpointGettersRefreshAndReturnCopies(t *testing.T) {
+	resetPricingEndpointTestTables(t)
+	insertPricingEndpointChannel(t, 106, constant.ChannelTypeOpenAI, dto.ChannelOtherSettings{})
+	insertPricingEndpointAbility(t, 106, "catalogue-refresh-model")
+	metadata := &Model{
+		ModelName: "catalogue-refresh-model",
+		Endpoints: `["anthropic"]`,
+		Status:    1,
+		NameRule:  NameRuleExact,
+	}
+	require.NoError(t, DB.Create(metadata).Error)
+	InitChannelCache()
+
+	wantPaths := map[string]common.EndpointInfo{
+		"openai":    {Path: "/v1/chat/completions", Method: "POST"},
+		"anthropic": {Path: "/v1/messages", Method: "POST"},
+	}
+	paths := GetSupportedEndpointMap()
+	require.Equal(t, wantPaths, paths)
+	paths["openai"] = common.EndpointInfo{Path: "/mutated", Method: "DELETE"}
+	delete(paths, "anthropic")
+	assert.Equal(t, wantPaths, GetSupportedEndpointMap())
+
+	wantTypes := []constant.EndpointType{constant.EndpointTypeOpenAI, constant.EndpointTypeAnthropic}
+	endpoints := GetModelSupportEndpointTypes(metadata.ModelName)
+	require.Equal(t, wantTypes, endpoints)
+	endpoints[0] = constant.EndpointTypeGemini
+	assert.Equal(t, wantTypes, GetModelSupportEndpointTypes(metadata.ModelName))
+
+	require.NoError(t, DB.Model(metadata).Update("endpoints", `["openai-response"]`).Error)
+	InvalidatePricingCache()
+	assert.Equal(t, []constant.EndpointType{
+		constant.EndpointTypeOpenAI,
+		constant.EndpointTypeOpenAIResponse,
+	}, GetModelSupportEndpointTypes(metadata.ModelName))
+	assert.NotContains(t, GetSupportedEndpointMap(), "anthropic")
+
+	require.NoError(t, DB.Model(metadata).Update("endpoints", `{"anthropic":{"path":"/custom/messages","method":"GET"}}`).Error)
+	InvalidatePricingCache()
+	wantPaths["anthropic"] = common.EndpointInfo{Path: "/custom/messages", Method: "GET"}
+	assert.Equal(t, wantPaths, GetSupportedEndpointMap())
+	assert.Equal(t, wantTypes, GetModelSupportEndpointTypes(metadata.ModelName))
+}
+
 func TestPricingModelMetadataEndpointsCanProvideEndpointWithoutChannelInference(t *testing.T) {
 	resetPricingEndpointTestTables(t)
 
