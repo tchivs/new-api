@@ -62,11 +62,12 @@ export const meta = {
     en: "MiniMax Hailuo video generation (text-to-video, image-to-video, and MiniMax-H3 multimodal reference)",
     zh: "MiniMax 海螺视频生成（文生视频、图生视频、MiniMax-H3 多模态参考生视频）",
   },
-  version: "1.2.1",
+  version: "1.2.2",
   author: { name: "QuantumNous" },
   channelTypes: [35],
   models: [
     "MiniMax-H3",
+    "minimax/minimax-h3",
     "MiniMax-Hailuo-2.3",
     "MiniMax-Hailuo-2.3-Fast",
     "MiniMax-Hailuo-02",
@@ -78,6 +79,7 @@ export const meta = {
     "S2V-01",
   ],
   fetchMode: "per_task",
+  allowedHosts: ["video-product.cdn.minimax.io"],
   // Fallback for a channel alias that resolves to more than one model: the
   // union of every family's fields and resolutions.
   usageSchema: Object.assign({}, H3_USAGE_SCHEMA, {
@@ -99,7 +101,7 @@ export const meta = {
   ],
   usageProfiles: [
     {
-      models: ["MiniMax-H3"],
+      models: ["MiniMax-H3", "minimax/minimax-h3"],
       schema: H3_USAGE_SCHEMA,
       examples: [
         { label: "H3 768P 5s", facts: { seconds: 5, resolution: "768P", input_images: 0, input_video_seconds: 0 } },
@@ -187,6 +189,7 @@ function hasHailuoImage(req, hasInputReferenceFile) {
 }
 
 const H3_MODEL = "MiniMax-H3";
+const H3_ZENMUX_MODEL = "minimax/minimax-h3";
 const H3_MIN_DURATION = 4;
 const H3_MAX_DURATION = 15;
 const H3_DEFAULT_DURATION = 5;
@@ -197,11 +200,10 @@ const H3_MAX_REFERENCE_AUDIOS = 3;
 const H3_MAX_INPUT_VIDEO_SECONDS = 15;
 const H3_RATIOS = ["adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"];
 
-// MiniMax-H3 speaks the /v2 video generation contract: a multimodal `content`
-// array instead of flat frame fields, an explicit `ratio`, 768P/2K resolutions,
-// a task id path parameter on query, and a `{task: {...}}` query envelope.
+// Official MiniMax-H3 uses /v2 and a task envelope; the Zenmux machine name
+// selects /v1/videos with the same multimodal body and a top-level task.
 function isH3(model) {
-  return model === H3_MODEL;
+  return model === H3_MODEL || model === H3_ZENMUX_MODEL;
 }
 
 function h3Duration(req) {
@@ -352,9 +354,17 @@ function h3Ratio(req, content) {
   return ratio;
 }
 
-function h3QueryTask(body) {
-  const task = body && typeof body === "object" && !Array.isArray(body) ? body.task : null;
-  return task && typeof task === "object" && !Array.isArray(task) ? task : null;
+function h3QueryTask(body, model) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return null;
+  const task = body.task;
+  if (task && typeof task === "object" && !Array.isArray(task)) return task;
+  return isH3(model || body.model) ? body : null;
+}
+
+function h3VideoURL(task) {
+  const content = task && task.content;
+  if (!content) return "";
+  return (typeof content.video_url === "string" && trimmed(content.video_url)) || (typeof content.url === "string" && trimmed(content.url)) || "";
 }
 
 function h3APIError(body) {
@@ -439,10 +449,14 @@ function responsesVideoText(ctx) {
 
 export function buildSubmitRequest(ctx) {
   const req = ctx.requestBody || {};
-  const model = ctx.upstreamModel;
+  const model = ctx.upstreamModel || ctx.model;
   const metadata = req.metadata || {};
   if (isH3(model)) {
     const content = h3Content(req);
+    // ponytail: Zenmux missing measured input-media usage, enable references after usage available.
+    if (model === H3_ZENMUX_MODEL && content.some(function (item) { return !item || item.type !== "text"; })) {
+      throw new Error("Zenmux MiniMax-H3 currently supports text-to-video only");
+    }
     const h3Body = {
       model: model,
       content: content,
@@ -454,7 +468,7 @@ export function buildSubmitRequest(ctx) {
       if (metadata[key] !== undefined && metadata[key] !== null) h3Body[key] = metadata[key];
     });
     return {
-      url: ctx.baseUrl + "/v2/video_generation",
+      url: ctx.baseUrl + (model === H3_ZENMUX_MODEL ? "/v1/videos" : "/v2/video_generation"),
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "application/json", Authorization: "Bearer " + ctx.apiKey },
       body: h3Body,
@@ -483,18 +497,19 @@ export function buildSubmitRequest(ctx) {
 
 export function parseSubmitResponse(ctx, resp) {
   const body = resp.body || {};
-  const apiError = isH3(ctx.upstreamModel) ? h3APIError(body) : null;
+  const model = ctx.upstreamModel || ctx.model;
+  const apiError = isH3(model) ? h3APIError(body) : null;
   if (apiError) throw new Error(apiError.message);
   const base = body.base_resp;
-  // /v1 always wraps the create response in a base_resp envelope; /v2 returns a
-  // bare task_id and only adds base_resp when the call is rejected.
+  // /v1 requires base_resp; official /v2 returns task_id, Zenmux returns id.
   if (base) {
     if (base.status_code !== 0) throw new Error(base.status_msg || "hailuo submit failed");
-  } else if (!isH3(ctx.upstreamModel)) {
+  } else if (!isH3(model)) {
     throw new Error("hailuo submit failed");
   }
-  if (!body.task_id) throw new Error("missing task_id");
-  return { taskId: body.task_id, taskData: body };
+  const taskId = model === H3_ZENMUX_MODEL ? body.id : body.task_id;
+  if (!taskId) throw new Error(model === H3_ZENMUX_MODEL ? "missing id" : "missing task_id");
+  return { taskId: taskId, taskData: body };
 }
 
 export function extractUsage(ctx) {
@@ -524,9 +539,12 @@ export function extractUsage(ctx) {
 export function buildQueryRequest(ctx) {
   // Polling carries no relay info; the host fills these identities from the
   // persisted task properties.
-  const path = isH3(ctx.upstreamModel || ctx.model)
-    ? "/v2/query/video_generation/" + encodeURIComponent(ctx.taskId)
-    : "/v1/query/video_generation?task_id=" + encodeURIComponent(ctx.taskId);
+  const model = ctx.upstreamModel || ctx.model;
+  const path = model === H3_ZENMUX_MODEL
+    ? "/v1/videos/" + encodeURIComponent(ctx.taskId)
+    : isH3(model)
+      ? "/v2/query/video_generation/" + encodeURIComponent(ctx.taskId)
+      : "/v1/query/video_generation?task_id=" + encodeURIComponent(ctx.taskId);
   return {
     url: ctx.baseUrl + path,
     method: "GET",
@@ -540,7 +558,10 @@ export function parseTaskResult(ctx, body) {
     if (apiError.statusCode === 408 || apiError.statusCode === 429 || apiError.statusCode >= 500) throw new Error(apiError.message);
     return { code: apiError.statusCode, status: "FAILURE", progress: "100%", reason: apiError.message };
   }
-  const h3Task = h3QueryTask(body);
+  if (body.base_resp && body.base_resp.status_code !== 0) {
+    return { code: body.base_resp.status_code || 0, status: "FAILURE", progress: "100%", reason: body.base_resp.status_msg || "" };
+  }
+  const h3Task = h3QueryTask(body, ctx.upstreamModel || ctx.model);
   if (h3Task) {
     const h3Statuses = { queued: "QUEUED", running: "IN_PROGRESS", succeeded: "SUCCESS", failed: "FAILURE", cancelled: "FAILURE" };
     const h3Status = h3Statuses[h3Task.status];
@@ -549,16 +570,14 @@ export function parseTaskResult(ctx, body) {
     }
     const h3Result = { code: 0, status: h3Status, progress: h3Status === "QUEUED" ? "30%" : h3Status === "IN_PROGRESS" ? "50%" : "100%" };
     if (h3Status === "SUCCESS") {
-      const url = trimmed(h3Task.content && h3Task.content.url);
-      if (url) h3Result.url = url;
+      const url = h3VideoURL(h3Task);
+      if (!url) return { status: "UNKNOWN", reason: "missing video URL" };
+      h3Result.url = url;
     }
     if (h3Status === "FAILURE") {
       h3Result.reason = trimmed(h3Task.error && h3Task.error.message) || "task " + trimmed(h3Task.status);
     }
     return h3Result;
-  }
-  if (body.base_resp && body.base_resp.status_code !== 0) {
-    return { code: body.base_resp.status_code || 0, status: "FAILURE", progress: "100%", reason: body.base_resp.status_msg || "" };
   }
   const base = body.base_resp || {};
   const statuses = { Preparing: "IN_PROGRESS", Queueing: "IN_PROGRESS", Processing: "IN_PROGRESS", Success: "SUCCESS", Fail: "FAILURE" };
@@ -581,10 +600,10 @@ function artifactFileID(ctx) {
   return trimmed(artifactData(ctx).file_id);
 }
 
-// /v2 tasks expose a public CDN URL instead of a downloadable file id.
+// H3 tasks expose a public CDN URL instead of a downloadable file id.
 function h3ArtifactURL(ctx) {
-  const task = h3QueryTask(artifactData(ctx));
-  return task ? trimmed(task.content && task.content.url) : "";
+  const task = h3QueryTask(artifactData(ctx), ctx.upstreamModel || ctx.model);
+  return h3VideoURL(task);
 }
 
 export function listArtifacts(task) {
@@ -620,7 +639,7 @@ export function buildContentRequest(ctx) {
 }
 
 export function extractUsageOnComplete(_task, _taskResult, body) {
-  const h3Task = h3QueryTask(body);
+  const h3Task = h3QueryTask(body, _task && (_task.upstreamModel || _task.model));
   if (h3Task) {
     const resolution = trimmed(h3Task.resolution).toUpperCase();
     const facts = {};

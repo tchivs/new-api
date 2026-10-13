@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
@@ -58,7 +59,7 @@ func TestHailuoUsageProfilesPerModel(t *testing.T) {
 		resolutions []string
 	}{
 		{
-			models:      []string{"MiniMax-H3"},
+			models:      []string{"MiniMax-H3", "minimax/minimax-h3"},
 			fields:      []string{"input_images", "input_video_seconds", "resolution", "seconds"},
 			resolutions: []string{"768P", "2K"},
 		},
@@ -280,16 +281,38 @@ func TestHailuoH3BuildSubmitRequest(t *testing.T) {
 		},
 	}
 	for _, testCase := range testCases {
-		t.Run(testCase.name, func(t *testing.T) {
-			descriptor := callHailuoHook(t, plugin, "buildSubmitRequest", hailuoH3SubmitContext(testCase.request))
-			assert.Equal(t, "https://api.minimax.example/v2/video_generation", descriptor["url"])
-			assert.Equal(t, "POST", descriptor["method"])
-			assert.Equal(t, testCase.wantAction, descriptor["action"])
-			body, err := common.Marshal(descriptor["body"])
-			require.NoError(t, err)
-			assert.JSONEq(t, testCase.wantBody, string(body))
-		})
+		for _, upstreamModel := range []string{"MiniMax-H3", "minimax/minimax-h3"} {
+			if upstreamModel == "minimax/minimax-h3" && testCase.wantAction == "image_to_video" {
+				continue
+			}
+			t.Run(testCase.name+"/"+upstreamModel, func(t *testing.T) {
+				ctx := hailuoH3SubmitContext(testCase.request)
+				ctx["upstreamModel"] = upstreamModel
+				descriptor := callHailuoHook(t, plugin, "buildSubmitRequest", ctx)
+				path := "/v2/video_generation"
+				if upstreamModel == "minimax/minimax-h3" {
+					path = "/v1/videos"
+				}
+				assert.Equal(t, "https://api.minimax.example"+path, descriptor["url"])
+				assert.Equal(t, "POST", descriptor["method"])
+				assert.Equal(t, testCase.wantAction, descriptor["action"])
+				assert.NotContains(t, descriptor, "model", "mapped client identity stays host-owned")
+				body, err := common.Marshal(descriptor["body"])
+				require.NoError(t, err)
+				assert.JSONEq(t, strings.ReplaceAll(testCase.wantBody, "MiniMax-H3", upstreamModel), string(body))
+			})
+		}
 	}
+	t.Run("Zenmux rejects input media until measured usage is available", func(t *testing.T) {
+		for _, mediaType := range []string{"image_url", "video_url", "audio_url"} {
+			ctx := hailuoH3SubmitContext(map[string]any{"prompt": "p", "metadata": map[string]any{"content": []any{
+				map[string]any{"type": mediaType, mediaType: map[string]any{"url": "https://cdn.example/input"}},
+			}}})
+			ctx["upstreamModel"] = "minimax/minimax-h3"
+			_, err := plugin.Engine.Call(t.Context(), "buildSubmitRequest", ctx)
+			require.ErrorContains(t, err, "currently supports text-to-video only")
+		}
+	})
 }
 
 // Every MiniMax-H3 request bound is rejected before the upstream call, so an
@@ -362,24 +385,32 @@ func TestHailuoH3RejectsOutOfContractRequests(t *testing.T) {
 		{"empty input", map[string]any{"prompt": "  "}, "requires a prompt or a media input"},
 	}
 	for _, testCase := range testCases {
-		t.Run(testCase.name, func(t *testing.T) {
-			_, err := plugin.Engine.Call(t.Context(), "buildSubmitRequest", hailuoH3SubmitContext(testCase.request))
-			require.ErrorContains(t, err, testCase.wantErr)
-		})
+		for _, upstreamModel := range []string{"MiniMax-H3", "minimax/minimax-h3"} {
+			t.Run(testCase.name+"/"+upstreamModel, func(t *testing.T) {
+				ctx := hailuoH3SubmitContext(testCase.request)
+				ctx["upstreamModel"] = upstreamModel
+				_, err := plugin.Engine.Call(t.Context(), "buildSubmitRequest", ctx)
+				require.ErrorContains(t, err, testCase.wantErr)
+			})
+		}
 	}
 }
 
 // The /v1 models keep the flat request shape and endpoint.
 func TestHailuoLegacySubmitRequestUnchanged(t *testing.T) {
 	plugin := loadHailuoPlugin(t)
-	ctx := hailuoH3SubmitContext(map[string]any{"prompt": "p", "duration": 10, "size": "768P"})
-	ctx["model"] = "MiniMax-Hailuo-2.3"
-	ctx["upstreamModel"] = "MiniMax-Hailuo-2.3"
-	descriptor := callHailuoHook(t, plugin, "buildSubmitRequest", ctx)
-	assert.Equal(t, "https://api.minimax.example/v1/video_generation", descriptor["url"])
-	body, err := common.Marshal(descriptor["body"])
-	require.NoError(t, err)
-	assert.JSONEq(t, `{"model":"MiniMax-Hailuo-2.3","prompt":"p","duration":10,"resolution":"768P"}`, string(body))
+	for _, name := range []string{"MiniMax-Hailuo-2.3", "MiniMax-H3-Max", "minimax/minimax-h3-max"} {
+		t.Run(name, func(t *testing.T) {
+			ctx := hailuoH3SubmitContext(map[string]any{"prompt": "p", "duration": 10, "size": "768P"})
+			ctx["model"] = name
+			ctx["upstreamModel"] = name
+			descriptor := callHailuoHook(t, plugin, "buildSubmitRequest", ctx)
+			assert.Equal(t, "https://api.minimax.example/v1/video_generation", descriptor["url"])
+			body, err := common.Marshal(descriptor["body"])
+			require.NoError(t, err)
+			assert.JSONEq(t, `{"model":"`+name+`","prompt":"p","duration":10,"resolution":"768P"}`, string(body))
+		})
+	}
 }
 
 func TestHailuoQueryRequestEndpointByModel(t *testing.T) {
@@ -409,6 +440,21 @@ func TestHailuoQueryRequestEndpointByModel(t *testing.T) {
 			ctx:  map[string]any{"taskId": "t1", "model": "h3", "upstreamModel": "MiniMax-H3"},
 			want: "https://api.minimax.example/v2/query/video_generation/t1",
 		},
+		{
+			name: "Zenmux mapped H3 uses native videos",
+			ctx:  map[string]any{"taskId": "opaque/1", "model": "MiniMax-H3", "upstreamModel": "minimax/minimax-h3"},
+			want: "https://api.minimax.example/v1/videos/opaque%2F1",
+		},
+		{
+			name: "Zenmux unmapped machine name",
+			ctx:  map[string]any{"taskId": "opaque", "model": "minimax/minimax-h3"},
+			want: "https://api.minimax.example/v1/videos/opaque",
+		},
+		{
+			name: "H3 Max is not ordinary H3",
+			ctx:  map[string]any{"taskId": "t1", "upstreamModel": "minimax/minimax-h3-max"},
+			want: "https://api.minimax.example/v1/query/video_generation?task_id=t1",
+		},
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -433,6 +479,18 @@ func TestHailuoParseTaskResult(t *testing.T) {
 		{"H3 queued", `{"task":{"id":"1","status":"queued"}}`, "QUEUED", "", ""},
 		{"H3 running", `{"task":{"id":"1","status":"running"}}`, "IN_PROGRESS", "", ""},
 		{"H3 succeeded", `{"task":{"id":"1","status":"succeeded","content":{"url":"https://cdn.example/h3.mp4"}}}`, "SUCCESS", "https://cdn.example/h3.mp4", ""},
+		{"H3 succeeded without video", `{"task":{"id":"1","status":"succeeded"}}`, "UNKNOWN", "", "missing video URL"},
+		{"H3 malformed video", `{"task":{"id":"1","status":"succeeded","content":{"url":{"url":"not a video URL"}}}}`, "UNKNOWN", "", "missing video URL"},
+		{"Zenmux queued", `{"id":"opaque","status":"queued","model":"minimax/minimax-h3"}`, "QUEUED", "", ""},
+		{"Zenmux running", `{"id":"opaque","status":"running","model":"minimax/minimax-h3"}`, "IN_PROGRESS", "", ""},
+		{"Zenmux succeeded", `{"id":"opaque","status":"succeeded","model":"minimax/minimax-h3","content":{"video_url":"https://video-product.cdn.minimax.io/h3.mp4?sig=1"}}`, "SUCCESS", "https://video-product.cdn.minimax.io/h3.mp4?sig=1", ""},
+		{"Zenmux missing video", `{"id":"opaque","status":"succeeded","model":"minimax/minimax-h3"}`, "UNKNOWN", "", "missing video URL"},
+		{"Zenmux blank video", `{"id":"opaque","status":"succeeded","model":"minimax/minimax-h3","content":{"video_url":" "}}`, "UNKNOWN", "", "missing video URL"},
+		{"Zenmux failed", `{"id":"opaque","status":"failed","model":"minimax/minimax-h3","error":{"message":"provider failed"}}`, "FAILURE", "", "provider failed"},
+		{"Zenmux cancelled", `{"id":"opaque","status":"cancelled","model":"minimax/minimax-h3"}`, "FAILURE", "", "task cancelled"},
+		{"Zenmux unknown", `{"id":"opaque","status":"weird","model":"minimax/minimax-h3"}`, "UNKNOWN", "", "unrecognized status: weird"},
+		{"Zenmux missing status", `{"id":"opaque","model":"minimax/minimax-h3"}`, "UNKNOWN", "", "unrecognized status: "},
+		{"H3 Max top-level is not ordinary H3", `{"id":"opaque","status":"succeeded","model":"minimax/minimax-h3-max","content":{"video_url":"https://cdn.example/max.mp4"}}`, "UNKNOWN", "", "unrecognized status: succeeded"},
 		{"H3 failed", `{"task":{"id":"1","status":"failed","error":{"code":"1026","message":"sensitive content"}}}`, "FAILURE", "", "sensitive content"},
 		{"H3 cancelled", `{"task":{"id":"1","status":"cancelled"}}`, "FAILURE", "", "task cancelled"},
 		{"H3 permanent query error", `{"type":"error","error":{"type":"authorized_error","message":"login failed","http_code":"401"}}`, "FAILURE", "", "login failed"},
@@ -452,6 +510,17 @@ func TestHailuoParseTaskResult(t *testing.T) {
 			assert.Equal(t, testCase.wantReason, common.Interface2String(result["reason"]))
 		})
 	}
+	t.Run("mapped Zenmux top-level result without echoed model", func(t *testing.T) {
+		ctx := map[string]any{"model": "MiniMax-H3", "upstreamModel": "minimax/minimax-h3"}
+		result := callHailuoHook(t, plugin, "parseTaskResult", ctx,
+			map[string]any{"id": "opaque", "status": "succeeded", "content": map[string]any{"video_url": "https://video-product.cdn.minimax.io/h3.mp4"}})
+		assert.Equal(t, "SUCCESS", result["status"])
+		result = callHailuoHook(t, plugin, "parseTaskResult", ctx, map[string]any{"status": "Success"})
+		assert.Equal(t, "UNKNOWN", result["status"], "legacy success without a video must not deliver an H3 success")
+		result = callHailuoHook(t, plugin, "parseTaskResult", ctx,
+			map[string]any{"status": "succeeded", "base_resp": map[string]any{"status_code": 1001, "status_msg": "upstream down"}})
+		assert.Equal(t, "FAILURE", result["status"])
+	})
 	t.Run("H3 retryable query error", func(t *testing.T) {
 		var body any
 		require.NoError(t, common.UnmarshalJsonStr(
@@ -477,6 +546,9 @@ func TestHailuoExtractUsageFacts(t *testing.T) {
 	}{
 		{"H3 defaults", "MiniMax-H3", map[string]any{"prompt": "p"}, map[string]any{
 			"seconds": float64(5), "resolution": "768P", "input_images": float64(0), "input_video_seconds": float64(0),
+		}},
+		{"Zenmux reserves requested quantities", "minimax/minimax-h3", map[string]any{"prompt": "p", "duration": 4}, map[string]any{
+			"seconds": float64(4), "resolution": "768P", "input_images": float64(0), "input_video_seconds": float64(0),
 		}},
 		{"H3 2K", "MiniMax-H3", map[string]any{"prompt": "p", "duration": 12, "size": "2K"}, map[string]any{
 			"seconds": float64(12), "resolution": "2K", "input_images": float64(0), "input_video_seconds": float64(0),
@@ -535,6 +607,19 @@ func TestHailuoH3CompletionUsageFacts(t *testing.T) {
 			body: `{"task":{"id":"1","status":"succeeded","resolution":"2K","usage":{"output_seconds":16,"input_seconds":16,"input_image_count":10}}}`,
 			want: map[string]any{"resolution": "2K"},
 		},
+		{
+			name: "Zenmux missing usage does not infer duration or resolution",
+			body: `{"id":"opaque","status":"succeeded","model":"minimax/minimax-h3","duration":12,"video_width":2048,"video_height":1152,"content":{"video_url":"https://video-product.cdn.minimax.io/h3.mp4"}}`,
+		},
+		{
+			name: "Zenmux bounded measured usage",
+			body: `{"id":"opaque","status":"succeeded","model":"minimax/minimax-h3","usage":{"output_seconds":4,"input_seconds":0,"input_image_count":0}}`,
+			want: map[string]any{"seconds": float64(4), "input_images": float64(0), "input_video_seconds": float64(0)},
+		},
+		{
+			name: "Zenmux out of contract usage preserves frozen reservation",
+			body: `{"id":"opaque","status":"succeeded","model":"minimax/minimax-h3","usage":{"output_seconds":16,"input_seconds":-1,"input_image_count":1.5}}`,
+		},
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -547,7 +632,7 @@ func TestHailuoH3CompletionUsageFacts(t *testing.T) {
 	t.Run("polling adaptor carries actual facts into task settlement", func(t *testing.T) {
 		adaptor := taskplugin.New(plugin)
 		result, err := adaptor.ParseTaskResult(&model.Task{}, &http.Response{StatusCode: http.StatusOK, Header: make(http.Header)}, []byte(
-			`{"task":{"id":"1","status":"succeeded","resolution":"2K","usage":{"output_seconds":5,"input_seconds":7.5,"input_image_count":6}}}`,
+			`{"task":{"id":"1","status":"succeeded","resolution":"2K","content":{"url":"https://cdn.example/h3.mp4"},"usage":{"output_seconds":5,"input_seconds":7.5,"input_image_count":6}}}`,
 		))
 		require.NoError(t, err)
 		assert.Equal(t, map[string]any{
@@ -567,26 +652,37 @@ func TestHailuoH3ArtifactContentProxy(t *testing.T) {
 	adaptor.Init(&relaycommon.RelayInfo{
 		ChannelMeta: &relaycommon.ChannelMeta{ApiKey: "test-ak", ChannelBaseUrl: "https://api.minimax.example"},
 	})
-	task := &model.Task{
-		TaskID: "task-public",
-		Status: model.TaskStatusSuccess,
-		Data:   []byte(`{"task":{"id":"1","status":"succeeded","content":{"url":"https://cdn.example/h3.mp4"}}}`),
+	for _, tc := range []struct {
+		name string
+		body string
+		url  string
+	}{
+		{"official", `{"task":{"id":"1","status":"succeeded","content":{"url":"https://cdn.example/h3.mp4"}}}`, "https://cdn.example/h3.mp4"},
+		{"Zenmux", `{"id":"opaque","status":"succeeded","model":"minimax/minimax-h3","content":{"video_url":"https://video-product.cdn.minimax.io/h3.mp4?sig=1"}}`, "https://video-product.cdn.minimax.io/h3.mp4?sig=1"},
+		{"missing video", `{"id":"opaque","status":"succeeded","model":"minimax/minimax-h3"}`, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			task := &model.Task{TaskID: "task-public", Status: model.TaskStatusSuccess, Data: []byte(tc.body)}
+			artifacts, err := adaptor.ListArtifacts(task)
+			require.NoError(t, err)
+			if tc.url == "" {
+				assert.Empty(t, artifacts)
+				_, err := adaptor.BuildContentRequest(t.Context(), task, "video", channel.TaskArtifactClientRequest{Method: http.MethodGet})
+				require.ErrorContains(t, err, "artifact_not_found")
+				return
+			}
+			assert.Equal(t, []channel.TaskArtifact{{Key: "video", Type: "video", MimeType: "video/mp4"}}, artifacts)
+			for _, method := range []string{http.MethodGet, http.MethodHead} {
+				descriptor, err := adaptor.BuildContentRequest(t.Context(), task, "video", channel.TaskArtifactClientRequest{Method: method})
+				require.NoError(t, err)
+				assert.Equal(t, &channel.TaskContentRequest{URL: tc.url, Method: method, Credentialless: true}, descriptor)
+			}
+			pending := &model.Task{TaskID: "task-public", Status: model.TaskStatusInProgress, Data: task.Data}
+			pendingArtifacts, err := adaptor.ListArtifacts(pending)
+			require.NoError(t, err)
+			assert.Empty(t, pendingArtifacts)
+		})
 	}
-
-	artifacts, err := adaptor.ListArtifacts(task)
-	require.NoError(t, err)
-	assert.Equal(t, []channel.TaskArtifact{{Key: "video", Type: "video", MimeType: "video/mp4"}}, artifacts)
-
-	descriptor, err := adaptor.BuildContentRequest(t.Context(), task, "video", channel.TaskArtifactClientRequest{Method: http.MethodGet})
-	require.NoError(t, err)
-	require.NotNil(t, descriptor)
-	assert.Equal(t, "https://cdn.example/h3.mp4", descriptor.URL)
-	assert.True(t, descriptor.Credentialless)
-
-	pending := &model.Task{TaskID: "task-public", Status: model.TaskStatusInProgress, Data: task.Data}
-	pendingArtifacts, err := adaptor.ListArtifacts(pending)
-	require.NoError(t, err)
-	assert.Empty(t, pendingArtifacts)
 }
 
 // The /v2 create response carries only task_id, without the /v1 base_resp envelope.
@@ -596,6 +692,18 @@ func TestHailuoParseSubmitResponse(t *testing.T) {
 		parsed := callHailuoHook(t, plugin, "parseSubmitResponse", map[string]any{"upstreamModel": "MiniMax-H3"},
 			map[string]any{"body": map[string]any{"task_id": "h3-1"}})
 		assert.Equal(t, "h3-1", parsed["taskId"])
+	})
+	t.Run("Zenmux mapped create returns opaque id", func(t *testing.T) {
+		body := map[string]any{"id": "opaque", "status": "queued", "model": "minimax/minimax-h3"}
+		parsed := callHailuoHook(t, plugin, "parseSubmitResponse",
+			map[string]any{"model": "MiniMax-H3", "upstreamModel": "minimax/minimax-h3"}, map[string]any{"body": body})
+		assert.Equal(t, "opaque", parsed["taskId"])
+		assert.Equal(t, body, parsed["taskData"])
+	})
+	t.Run("Zenmux missing id is rejected", func(t *testing.T) {
+		_, err := plugin.Engine.Call(t.Context(), "parseSubmitResponse", map[string]any{"upstreamModel": "minimax/minimax-h3"},
+			map[string]any{"body": map[string]any{"status": "queued"}})
+		require.ErrorContains(t, err, "missing id")
 	})
 	t.Run("H3 rejection reports the envelope message", func(t *testing.T) {
 		_, err := plugin.Engine.Call(t.Context(), "parseSubmitResponse", map[string]any{"upstreamModel": "MiniMax-H3"},
@@ -631,19 +739,24 @@ func TestHailuoParseSubmitResponse(t *testing.T) {
 // duration on the OpenAI Video path before the request is ever built.
 func TestHailuoH3PassesOpenAIVideoDecode(t *testing.T) {
 	plugin := loadHailuoPlugin(t)
-	value, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"},
-		map[string]any{
-			"body":          map[string]any{"kind": "json", "value": map[string]any{"model": "MiniMax-H3", "prompt": "p", "seconds": 12, "size": "2K"}},
-			"model":         "MiniMax-H3",
-			"upstreamModel": "MiniMax-H3",
+	for _, upstreamModel := range []string{"MiniMax-H3", "minimax/minimax-h3"} {
+		t.Run(upstreamModel, func(t *testing.T) {
+			value, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"},
+				map[string]any{
+					"body":          map[string]any{"kind": "json", "value": map[string]any{"model": "MiniMax-H3", "prompt": "p", "seconds": 12, "size": "2K"}},
+					"model":         "MiniMax-H3",
+					"upstreamModel": upstreamModel,
+				})
+			require.NoError(t, err)
+			encoded, err := common.Marshal(value)
+			require.NoError(t, err)
+			var intent map[string]any
+			require.NoError(t, common.Unmarshal(encoded, &intent))
+			assert.Equal(t, "submit", intent["kind"])
+			assert.Equal(t, "MiniMax-H3", intent["model"])
+			requestBody, ok := intent["requestBody"].(map[string]any)
+			require.True(t, ok)
+			assert.Equal(t, float64(12), requestBody["duration"])
 		})
-	require.NoError(t, err)
-	encoded, err := common.Marshal(value)
-	require.NoError(t, err)
-	var intent map[string]any
-	require.NoError(t, common.Unmarshal(encoded, &intent))
-	assert.Equal(t, "submit", intent["kind"])
-	requestBody, ok := intent["requestBody"].(map[string]any)
-	require.True(t, ok)
-	assert.Equal(t, float64(12), requestBody["duration"])
+	}
 }
