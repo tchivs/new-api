@@ -13,6 +13,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	builtinplugins "github.com/QuantumNous/new-api/plugins"
+	"github.com/QuantumNous/new-api/relay"
 	"github.com/QuantumNous/new-api/relay/channel"
 	taskplugin "github.com/QuantumNous/new-api/relay/channel/task/jsplugin"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -664,16 +665,29 @@ func TestHailuoH3ArtifactContentProxy(t *testing.T) {
 		ChannelMeta: &relaycommon.ChannelMeta{ApiKey: "test-ak", ChannelBaseUrl: "https://api.minimax.example"},
 	})
 	for _, tc := range []struct {
-		name string
-		body string
-		url  string
+		name       string
+		body       string
+		url        string
+		properties model.Properties
 	}{
-		{"official", `{"task":{"id":"1","status":"succeeded","content":{"url":"https://cdn.example/h3.mp4"}}}`, "https://cdn.example/h3.mp4"},
-		{"Zenmux", `{"id":"opaque","status":"succeeded","model":"minimax/minimax-h3","content":{"video_url":"https://video-product.cdn.minimax.io/h3.mp4?sig=1"}}`, "https://video-product.cdn.minimax.io/h3.mp4?sig=1"},
-		{"missing video", `{"id":"opaque","status":"succeeded","model":"minimax/minimax-h3"}`, ""},
+		{name: "official", body: `{"task":{"id":"1","status":"succeeded","content":{"url":"https://cdn.example/h3.mp4"}}}`, url: "https://cdn.example/h3.mp4"},
+		{name: "Zenmux", body: `{"id":"opaque","status":"succeeded","model":"minimax/minimax-h3","content":{"video_url":"https://video-product.cdn.minimax.io/h3.mp4?sig=1"}}`, url: "https://video-product.cdn.minimax.io/h3.mp4?sig=1"},
+		{name: "missing video", body: `{"id":"opaque","status":"succeeded","model":"minimax/minimax-h3"}`},
+		{
+			name:       "model-less Zenmux uses persisted upstream model",
+			body:       `{"id":"opaque","status":"succeeded","content":{"video_url":"https://video-product.cdn.minimax.io/h3.mp4?sig=1"}}`,
+			url:        "https://video-product.cdn.minimax.io/h3.mp4?sig=1",
+			properties: model.Properties{OriginModelName: "MiniMax-H3", UpstreamModelName: "minimax/minimax-h3"},
+		},
+		{
+			name:       "model-less Zenmux falls back to persisted origin model",
+			body:       `{"id":"opaque","status":"succeeded","content":{"video_url":"https://video-product.cdn.minimax.io/h3.mp4?sig=1"}}`,
+			url:        "https://video-product.cdn.minimax.io/h3.mp4?sig=1",
+			properties: model.Properties{OriginModelName: "minimax/minimax-h3"},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			task := &model.Task{TaskID: "task-public", Status: model.TaskStatusSuccess, Data: []byte(tc.body)}
+			task := &model.Task{TaskID: "task-public", Status: model.TaskStatusSuccess, Data: []byte(tc.body), Properties: tc.properties}
 			artifacts, err := adaptor.ListArtifacts(task)
 			require.NoError(t, err)
 			if tc.url == "" {
@@ -682,13 +696,31 @@ func TestHailuoH3ArtifactContentProxy(t *testing.T) {
 				require.ErrorContains(t, err, "artifact_not_found")
 				return
 			}
-			assert.Equal(t, []channel.TaskArtifact{{Key: "video", Type: "video", MimeType: "video/mp4"}}, artifacts)
+			require.Equal(t, []channel.TaskArtifact{{Key: "video", Type: "video", MimeType: "video/mp4"}}, artifacts)
 			for _, method := range []string{http.MethodGet, http.MethodHead} {
 				descriptor, err := adaptor.BuildContentRequest(t.Context(), task, "video", channel.TaskArtifactClientRequest{Method: method})
 				require.NoError(t, err)
 				assert.Equal(t, &channel.TaskContentRequest{URL: tc.url, Method: method, Credentialless: true}, descriptor)
 			}
-			pending := &model.Task{TaskID: "task-public", Status: model.TaskStatusInProgress, Data: task.Data}
+			injectedArtifacts := make(map[string]any, len(artifacts))
+			for _, artifact := range artifacts {
+				injectedArtifacts[artifact.Key] = map[string]any{"url": "https://gateway.example/v1/tasks/task-public/artifacts/" + artifact.Key + "/content"}
+			}
+			var data map[string]any
+			require.NoError(t, common.Unmarshal(task.Data, &data))
+			value, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_responses", "renderFinal"},
+				map[string]any{"requestBody": map[string]any{"model": "MiniMax-H3"}, "artifacts": injectedArtifacts},
+				map[string]any{"task_id": task.TaskID, "status": "SUCCESS", "data": data})
+			require.NoError(t, err)
+			machine := relay.NewPluginResponsesMachine(task.TaskID, "MiniMax-H3", 10, relay.DefaultPluginProtocolLimits())
+			response, err := machine.FinalResponse(value, "SUCCESS")
+			require.NoError(t, err)
+			assert.Equal(t, "completed", response["status"])
+			encoded, err := common.Marshal(response)
+			require.NoError(t, err)
+			assert.Contains(t, string(encoded), "https://gateway.example/v1/tasks/task-public/artifacts/video/content")
+			assert.NotContains(t, string(encoded), tc.url)
+			pending := &model.Task{TaskID: "task-public", Status: model.TaskStatusInProgress, Data: task.Data, Properties: task.Properties}
 			pendingArtifacts, err := adaptor.ListArtifacts(pending)
 			require.NoError(t, err)
 			assert.Empty(t, pendingArtifacts)

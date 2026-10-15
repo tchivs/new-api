@@ -1098,10 +1098,16 @@ func taskArtifactContext(task *model.Task) (map[string]any, error) {
 			return nil, fmt.Errorf("plugin state is invalid")
 		}
 	}
+	upstreamModel := task.Properties.UpstreamModelName
+	if upstreamModel == "" {
+		upstreamModel = task.Properties.OriginModelName
+	}
 	return map[string]any{
 		"taskId":          task.TaskID,
 		"status":          string(task.Status),
 		"action":          task.Action,
+		"model":           task.Properties.OriginModelName,
+		"upstreamModel":   upstreamModel,
 		"data":            data,
 		"state":           state,
 		"producerVersion": producerVersion,
