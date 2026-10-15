@@ -84,14 +84,35 @@ func ClaudeErrorWrapperLocal(err error, code string, statusCode int) *dto.Claude
 	return claudeErr
 }
 
+// upstreamResponseReadError keeps transport diagnostics available to errors.Is
+// and errors.As without exposing upstream-controlled text through either API.
+type upstreamResponseReadError struct {
+	statusCode int
+	cause      error
+}
+
+func (e *upstreamResponseReadError) Error() string {
+	return fmt.Sprintf("bad response status code %d: failed to read response body", e.statusCode)
+}
+
+func (e *upstreamResponseReadError) Unwrap() error {
+	return e.cause
+}
+
 func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFail bool) (newApiErr *types.NewAPIError) {
 	newApiErr = types.InitOpenAIError(types.ErrorCodeBadResponseStatusCode, resp.StatusCode)
+	defer CloseResponseBodyGracefully(resp)
 
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
+		readErr := &upstreamResponseReadError{statusCode: resp.StatusCode, cause: err}
+		newApiErr = types.NewOpenAIError(readErr, types.ErrorCodeBadResponseStatusCode, resp.StatusCode)
+		newApiErr.Err = readErr
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+			types.ErrOptionWithSkipRetry()(newApiErr)
+		}
 		return
 	}
-	CloseResponseBodyGracefully(resp)
 	var errResponse dto.GeneralErrorResponse
 	responseBodyText := string(responseBody)
 	responseBodyPreview := common.LocalLogPreview(responseBodyText)

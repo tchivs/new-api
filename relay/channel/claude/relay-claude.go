@@ -361,7 +361,7 @@ func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 	info.StreamStatus.RequireTerminal()
 	if err != nil {
 		if info.RelayFormat == types.RelayFormatClaude &&
-			c != nil && c.Writer != nil && c.Writer.Written() &&
+			relaycommon.StreamResponseWritten(c) &&
 			c.Request != nil && c.Request.Context().Err() == nil {
 			writeClaudeStreamError(c, err)
 			return claudeInfo.Usage, nil
@@ -383,7 +383,7 @@ func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 			if info.StreamStatus != nil {
 				info.StreamStatus.RecordError(claudeStreamMissingMessageStop)
 			}
-			if c != nil && c.Writer != nil && c.Writer.Written() &&
+			if relaycommon.StreamResponseWritten(c) &&
 				c.Request != nil && c.Request.Context().Err() == nil {
 				writeClaudeStreamError(c, incompleteErr)
 				return claudeInfo.Usage, nil

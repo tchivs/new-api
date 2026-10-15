@@ -2,12 +2,17 @@ package channel
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -24,6 +29,126 @@ func TestNewTaskAPIRequestInheritsClientCancellation(t *testing.T) {
 	cancel()
 
 	require.ErrorIs(t, upstream.Context().Err(), context.Canceled)
+}
+
+type requestCancellationAdaptor struct {
+	Adaptor
+	url string
+}
+
+func (a requestCancellationAdaptor) GetRequestURL(*relaycommon.RelayInfo) (string, error) {
+	return a.url, nil
+}
+
+func (a requestCancellationAdaptor) SetupRequestHeader(c *gin.Context, header *http.Header, info *relaycommon.RelayInfo) error {
+	SetupApiRequestHeader(info, c, header)
+	header.Set("X-Test-Header", "adaptor")
+	return nil
+}
+
+func TestAPIRequestsInheritClientCancellation(t *testing.T) {
+	service.InitHttpClient()
+	for _, tc := range []struct {
+		name string
+		do   func(Adaptor, *gin.Context, *relaycommon.RelayInfo, io.Reader) (*http.Response, error)
+	}{
+		{name: "API", do: DoApiRequest},
+		{name: "form", do: DoFormRequest},
+	} {
+		t.Run(tc.name+"/before send", func(t *testing.T) {
+			var calls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer server.Close()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/relay", nil).WithContext(ctx)
+			info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}}
+			cancel()
+
+			resp, err := tc.do(requestCancellationAdaptor{url: server.URL}, c, info, strings.NewReader("request body"))
+			if resp != nil {
+				defer resp.Body.Close()
+			}
+			require.Error(t, err)
+			assert.Nil(t, resp)
+			assert.Zero(t, calls.Load(), "a canceled client must not send an upstream request")
+		})
+
+		t.Run(tc.name+"/in flight", func(t *testing.T) {
+			type observedRequest struct {
+				method      string
+				contentType string
+				header      string
+				body        string
+				readErr     error
+			}
+			received := make(chan observedRequest, 1)
+			serverCanceled := make(chan struct{})
+			release := make(chan struct{})
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, err := io.ReadAll(r.Body)
+				received <- observedRequest{r.Method, r.Header.Get("Content-Type"), r.Header.Get("X-Test-Header"), string(body), err}
+				select {
+				case <-r.Context().Done():
+					close(serverCanceled)
+				case <-release:
+				}
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			ctx, cancel := context.WithCancel(context.Background())
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPut, "/relay", nil).WithContext(ctx)
+			const contentType = "multipart/form-data; boundary=fixture"
+			c.Request.Header.Set("Content-Type", contentType)
+			info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{
+				HeadersOverride: map[string]any{"X-Test-Header": "override"},
+			}}
+			result := make(chan error, 1)
+			finished := make(chan struct{})
+			go func() {
+				defer close(finished)
+				resp, err := tc.do(requestCancellationAdaptor{url: server.URL}, c, info, strings.NewReader("request body"))
+				if resp != nil {
+					_ = resp.Body.Close()
+				}
+				result <- err
+			}()
+			t.Cleanup(func() {
+				cancel()
+				close(release)
+				server.Close()
+				<-finished
+			})
+			timeout := time.NewTimer(5 * time.Second)
+			defer timeout.Stop()
+			select {
+			case request := <-received:
+				require.NoError(t, request.readErr)
+				assert.Equal(t, http.MethodPut, request.method)
+				assert.Equal(t, contentType, request.contentType)
+				assert.Equal(t, "override", request.header)
+				assert.Equal(t, "request body", request.body)
+			case <-timeout.C:
+				t.Fatal("upstream did not receive the request")
+			}
+			cancel()
+			select {
+			case err := <-result:
+				require.Error(t, err)
+			case <-timeout.C:
+				t.Fatal("upstream request did not stop after client cancellation")
+			}
+			select {
+			case <-serverCanceled:
+			case <-timeout.C:
+				t.Fatal("upstream server did not observe cancellation")
+			}
+		})
+	}
 }
 
 func TestProcessHeaderOverride_ChannelTestSkipsPassthroughRules(t *testing.T) {

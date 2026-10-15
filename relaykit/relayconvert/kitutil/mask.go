@@ -12,6 +12,11 @@ var (
 	maskIPPattern     = regexp.MustCompile(`\b(?:\d{1,3}\.){3}\d{1,3}\b`)
 	// maskApiKeyPattern matches patterns like 'api_key:xxx' or "api_key:xxx" to mask the API key value
 	maskApiKeyPattern = regexp.MustCompile(`(['"]?)api_key:([^\s'"]+)(['"]?)`)
+	// Only known protocol fields in diagnostic context may bypass domain masking.
+	maskThinkingFieldPattern        = regexp.MustCompile(`^(?:(?:body|request)\.)?thinking\.(?:(?:enabled|adaptive)\.)?display$`)
+	maskFieldLabelPattern           = regexp.MustCompile("(?i)(?:^|[\\s{,])['\"`]?(?:field|parameter|param|property)['\"`]?\\s*(?:[:=]\\s*)?['\"`]?$")
+	maskFieldDiagnosticStartPattern = regexp.MustCompile("(?i)(?:^|[\\r\\n])\\s*(?:(?:upstream )?(?:validation error|invalid request|error)\\s*:\\s*)?['\"`]?$")
+	maskFieldValidationPattern      = regexp.MustCompile("(?i)^['\"`]?\\s*:\\s+(?:input should\\b|field required\\b|extra inputs\\b|invalid\\b|expected\\b|must\\b|should\\b)")
 )
 
 // maskHostTail returns the tail parts of a domain/host that should be preserved.
@@ -51,6 +56,30 @@ func maskHostForPlainDomain(domain string) string {
 	numStars := max(len(parts)-len(tail), 1)
 	stars := strings.TrimSuffix(strings.Repeat("***.", numStars), ".")
 	return stars + "." + strings.Join(tail, ".")
+}
+
+// isDiagnosticFieldPath distinguishes known field names from identical hostnames.
+// Unknown dotted strings remain masked even in validation errors.
+func isDiagnosticFieldPath(message string, start, end int) bool {
+	if !maskThinkingFieldPattern.MatchString(message[start:end]) {
+		return false
+	}
+	// Do not exempt a field-shaped substring of a URL, address, or larger token.
+	if start > 0 && strings.ContainsRune("/@._-?=&%", rune(message[start-1])) {
+		return false
+	}
+	if end < len(message) && strings.ContainsRune("/@._-?#=%", rune(message[end])) {
+		return false
+	}
+	if end+1 < len(message) && message[end] == ':' && message[end+1] >= '0' && message[end+1] <= '9' {
+		return false
+	}
+	prefix := message[:start]
+	if maskFieldLabelPattern.MatchString(prefix) {
+		return true
+	}
+	// An enum hint alone must not exempt a hostname in surrounding prose.
+	return maskFieldDiagnosticStartPattern.MatchString(prefix) && maskFieldValidationPattern.MatchString(message[end:])
 }
 
 // MaskSensitiveInfo masks sensitive information like URLs, IPs, and domain names in a string
@@ -116,10 +145,24 @@ func MaskSensitiveInfo(str string) string {
 		return result
 	})
 
-	// Mask domain names without protocol (like openai.com, www.openai.com)
-	str = maskDomainPattern.ReplaceAllStringFunc(str, func(domain string) string {
-		return maskHostForPlainDomain(domain)
-	})
+	// Mask plain domains, retaining only recognized diagnostic field paths.
+	if domains := maskDomainPattern.FindAllStringIndex(str, -1); len(domains) > 0 {
+		var masked strings.Builder
+		masked.Grow(len(str))
+		last := 0
+		for _, domain := range domains {
+			start, end := domain[0], domain[1]
+			masked.WriteString(str[last:start])
+			if isDiagnosticFieldPath(str, start, end) {
+				masked.WriteString(str[start:end])
+			} else {
+				masked.WriteString(maskHostForPlainDomain(str[start:end]))
+			}
+			last = end
+		}
+		masked.WriteString(str[last:])
+		str = masked.String()
+	}
 
 	// Mask IP addresses
 	str = maskIPPattern.ReplaceAllString(str, "***.***.***.***")

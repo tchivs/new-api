@@ -5,6 +5,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/gin-gonic/gin"
 )
 
 type StreamEndReason string
@@ -34,6 +36,20 @@ const (
 )
 
 const maxStreamErrorEntries = 20
+
+const streamResponseWrittenKey = "relay_stream_response_written"
+
+// MarkStreamResponseWritten records downstream protocol data, not headers or
+// keepalive pings. It belongs to the request and must survive per-attempt resets.
+func MarkStreamResponseWritten(c *gin.Context) {
+	if c != nil {
+		c.Set(streamResponseWrittenKey, true)
+	}
+}
+
+func StreamResponseWritten(c *gin.Context) bool {
+	return c != nil && c.GetBool(streamResponseWrittenKey)
+}
 
 type StreamErrorEntry struct {
 	Message   string

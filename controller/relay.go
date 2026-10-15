@@ -23,6 +23,7 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
+	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
@@ -92,19 +93,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			service.RecordRequestPolicyTermination(c, newAPIError)
 			logger.LogError(c, common.LogText("relay error: %s", common.LocalLogPreview(newAPIError.Error())))
 			newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestId))
-			switch relayFormat {
-			case types.RelayFormatOpenAIRealtime:
-				helper.WssError(c, ws, newAPIError.ToOpenAIError())
-			case types.RelayFormatClaude:
-				c.JSON(newAPIError.StatusCode, gin.H{
-					"type":  "error",
-					"error": newAPIError.ToClaudeError(),
-				})
-			default:
-				c.JSON(newAPIError.StatusCode, gin.H{
-					"error": newAPIError.ToOpenAIError(),
-				})
-			}
+			respondRelayError(c, relayFormat, ws, newAPIError)
 		}
 	}()
 
@@ -218,6 +207,52 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	if len(useChannel) > 1 {
 		retryLogStr := common.LogText("retry: %s", strings.Trim(strings.Join(strings.Fields(fmt.Sprint(useChannel)), "->"), "[]"))
 		logger.LogInfo(c, retryLogStr)
+	}
+}
+
+func respondRelayError(c *gin.Context, relayFormat types.RelayFormat, ws *websocket.Conn, apiErr *types.NewAPIError) {
+	if c == nil || c.Writer == nil || apiErr == nil ||
+		c.Request != nil && c.Request.Context().Err() != nil {
+		return
+	}
+	if relayFormat == types.RelayFormatOpenAIRealtime {
+		helper.WssError(c, ws, apiErr.ToOpenAIError())
+		return
+	}
+
+	// A keepalive may have opened SSE without committing a generation. It must
+	// not block retries, but the final error still belongs inside that stream.
+	if relaycommon.StreamResponseWritten(c) ||
+		c.Writer.Written() && strings.HasPrefix(c.Writer.Header().Get("Content-Type"), "text/event-stream") {
+		var writeErr error
+		switch relayFormat {
+		case types.RelayFormatClaude:
+			writeErr = helper.ClaudeData(c, dto.ClaudeResponse{Type: "error", Error: apiErr.ToClaudeError()})
+		case types.RelayFormatOpenAIResponses, types.RelayFormatOpenAIResponsesCompaction:
+			openaiErr := apiErr.ToOpenAIError()
+			response := dto.ResponsesStreamResponse{
+				Type: "error", Code: string(apiErr.GetErrorCode()), Message: openaiErr.Message, Param: openaiErr.Param,
+			}
+			var data []byte
+			data, writeErr = common.Marshal(response)
+			if writeErr == nil {
+				writeErr = helper.ResponseChunkData(c, response, string(data))
+			}
+		default:
+			writeErr = helper.ObjectData(c, gin.H{"error": apiErr.ToOpenAIError()})
+		}
+		if writeErr != nil {
+			logger.LogError(c, "send relay stream error failed: "+writeErr.Error())
+		}
+		return
+	}
+
+	// Merely preparing SSE headers does not commit a response body or status.
+	c.Header("Content-Type", "application/json; charset=utf-8")
+	if relayFormat == types.RelayFormatClaude {
+		c.JSON(apiErr.StatusCode, gin.H{"type": "error", "error": apiErr.ToClaudeError()})
+	} else {
+		c.JSON(apiErr.StatusCode, gin.H{"error": apiErr.ToOpenAIError()})
 	}
 }
 
