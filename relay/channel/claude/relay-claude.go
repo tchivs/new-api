@@ -333,7 +333,7 @@ func writeClaudeStreamError(c *gin.Context, apiErr *types.NewAPIError) {
 	}
 	response := dto.ClaudeResponse{
 		Type:  "error",
-		Error: apiErr.ToClaudeError(),
+		Error: apiErr.ToClaudeError(common.UpstreamAddresses(c)...),
 	}
 	if err := helper.ClaudeData(c, response); err != nil {
 		logger.LogError(c, "send Claude stream error failed: "+err.Error())

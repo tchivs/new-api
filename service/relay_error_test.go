@@ -105,6 +105,7 @@ func TestProcessChannelErrorMasksDisableReasonAndNotification(t *testing.T) {
 	notifyLimitStore.Delete(notifyKey)
 	t.Cleanup(func() { notifyLimitStore.Delete(notifyKey) })
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, "https://private.example.com")
 	apiErr := types.NewErrorWithStatusCode(errors.New("request.thinking.display: Input should be 'summarized', 'omitted'; upstream https://private.example.com/path?token=review-token api_key:review-secret"), types.ErrorCodeChannelNoAvailableKey, http.StatusUnauthorized)
 	ProcessChannelError(c, types.ChannelError{ChannelId: channel.Id, ChannelName: channel.Name, AutoBan: true}, apiErr, nil)
 	var notification WebhookPayload
@@ -128,39 +129,46 @@ func TestProcessChannelErrorMasksDisableReasonAndNotification(t *testing.T) {
 func TestMaskSensitiveInfoDiagnosticFields(t *testing.T) {
 	// These are synthetic diagnostic paths, not reconstructed production errors.
 	for _, test := range []struct {
-		name  string
-		input string
-		want  string
+		name         string
+		input        string
+		want         string
+		upstreamURLs []string
 	}{
 		{
-			name:  "request path alongside URL credentials domain IP and API key",
-			input: "request.thinking.display: Input should be 'summarized', 'omitted'; host api.example.co.uk address 192.168.1.1 upstream https://user:password@private.example.com/tenant/path?token=review-token#fragment api_key:review-secret",
-			want:  "request.thinking.display: Input should be 'summarized', 'omitted'; host ***.***.co.uk address ***.***.***.*** upstream https://***.com/***/***?token=*** api_key:***",
+			name:         "request path alongside URL credentials domain IP and API key",
+			input:        "request.thinking.display: Input should be 'summarized', 'omitted'; host api.example.co.uk address 192.168.1.1 upstream https://user:password@private.example.com/tenant/path?token=review-token#fragment api_key:review-secret",
+			want:         "request.thinking.display: Input should be 'summarized', 'omitted'; host ***.***.co.uk address ***.***.***.*** upstream https://***.com/***/***?token=*** api_key:***",
+			upstreamURLs: []string{"https://api.example.co.uk", "https://private.example.com"},
 		},
 		{
-			name:  "nested body field does not exempt other validation domains",
-			input: "body.thinking.adaptive.display: Input should be 'summarized', 'omitted'; private.gateway.display: Input should be valid; api.example.com: Invalid value",
-			want:  "body.thinking.adaptive.display: Input should be 'summarized', 'omitted'; ***.***.display: Input should be valid; ***.***.com: Invalid value",
+			name:         "nested body field does not exempt other validation domains",
+			input:        "body.thinking.adaptive.display: Input should be 'summarized', 'omitted'; private.gateway.display: Input should be valid; api.example.com: Invalid value",
+			want:         "body.thinking.adaptive.display: Input should be 'summarized', 'omitted'; ***.***.display: Input should be valid; ***.***.com: Invalid value",
+			upstreamURLs: []string{"https://private.gateway.display", "https://api.example.com"},
 		},
 		{
-			name:  "enabled fields retain context while identical hostnames stay masked",
-			input: "thinking.enabled.display: Input should be 'omitted'; field 'body.thinking.enabled.display' is invalid; host thinking.enabled.display: Input should be 'omitted'; lookup body.thinking.enabled.display: no such host; upstream https://thinking.enabled.display/private?key=review-token api_key:review-secret",
-			want:  "thinking.enabled.display: Input should be 'omitted'; field 'body.thinking.enabled.display' is invalid; host ***.***.display: Input should be 'omitted'; lookup ***.***.***.display: no such host; upstream https://***.display/***?key=*** api_key:***",
+			name:         "enabled fields retain context while identical hostnames stay masked",
+			input:        "thinking.enabled.display: Input should be 'omitted'; field 'body.thinking.enabled.display' is invalid; host thinking.enabled.display: Input should be 'omitted'; lookup body.thinking.enabled.display: no such host; upstream https://thinking.enabled.display/private?key=review-token api_key:review-secret",
+			want:         "thinking.enabled.display: Input should be 'omitted'; field 'body.thinking.enabled.display' is invalid; host ***.***.display: Input should be 'omitted'; lookup ***.***.***.display: no such host; upstream https://***.display/***?key=*** api_key:***",
+			upstreamURLs: []string{"https://thinking.enabled.display", "https://body.thinking.enabled.display"},
 		},
 		{
-			name:  "same spelling is masked when used as a hostname",
-			input: "thinking.display: Input should be 'summarized', 'omitted'; lookup thinking.display: no such host; dial request.thinking.display:443 failed",
-			want:  "thinking.display: Input should be 'summarized', 'omitted'; lookup ***.display: no such host; dial ***.***.display:443 failed",
+			name:         "same spelling is masked when used as a hostname",
+			input:        "thinking.display: Input should be 'summarized', 'omitted'; lookup thinking.display: no such host; dial request.thinking.display:443 failed",
+			want:         "thinking.display: Input should be 'summarized', 'omitted'; lookup ***.display: no such host; dial ***.***.display:443 failed",
+			upstreamURLs: []string{"https://thinking.display", "https://request.thinking.display"},
 		},
 		{
-			name:  "enum hint after hostname is not a field context",
-			input: "thinking.display: Input should be 'omitted'; host thinking.display: Input should be 'summarized', 'omitted'; host: request.thinking.display: Input should be valid; api_key:review-secret",
-			want:  "thinking.display: Input should be 'omitted'; host ***.display: Input should be 'summarized', 'omitted'; host: ***.***.display: Input should be valid; api_key:***",
+			name:         "enum hint after hostname is not a field context",
+			input:        "thinking.display: Input should be 'omitted'; host thinking.display: Input should be 'summarized', 'omitted'; host: request.thinking.display: Input should be valid; api_key:review-secret",
+			want:         "thinking.display: Input should be 'omitted'; host ***.display: Input should be 'summarized', 'omitted'; host: ***.***.display: Input should be valid; api_key:***",
+			upstreamURLs: []string{"https://thinking.display", "https://request.thinking.display"},
 		},
 		{
-			name:  "validation diagnostic at line start",
-			input: "upstream private.example.com rejected the request\n  body.thinking.adaptive.display: Input should be 'summarized', 'omitted'",
-			want:  "upstream ***.***.com rejected the request\n  body.thinking.adaptive.display: Input should be 'summarized', 'omitted'",
+			name:         "validation diagnostic at line start",
+			input:        "upstream private.example.com rejected the request\n  body.thinking.adaptive.display: Input should be 'summarized', 'omitted'",
+			want:         "upstream ***.***.com rejected the request\n  body.thinking.adaptive.display: Input should be 'summarized', 'omitted'",
+			upstreamURLs: []string{"https://private.example.com"},
 		},
 		{
 			name:  "explicit diagnostic prefix",
@@ -168,33 +176,104 @@ func TestMaskSensitiveInfoDiagnosticFields(t *testing.T) {
 			want:  "upstream validation error: request.thinking.display: Input should be 'omitted'; api_key:***",
 		},
 		{
-			name:  "quoted field label without a validation suffix",
-			input: "Invalid field 'thinking.display' from private.example.org with 'api_key:review-secret'",
-			want:  "Invalid field 'thinking.display' from ***.***.org with 'api_key:***'",
+			name:         "quoted field label without a validation suffix",
+			input:        "Invalid field 'thinking.display' from private.example.org with 'api_key:review-secret'",
+			want:         "Invalid field 'thinking.display' from ***.***.org with 'api_key:***'",
+			upstreamURLs: []string{"https://private.example.org"},
 		},
 		{
-			name:  "quoted parameter and a field-shaped URL host",
-			input: `Invalid parameter "request.thinking.display" from https://user:password@request.thinking.display/private?key=review-token with "api_key:review-secret"`,
-			want:  `Invalid parameter "request.thinking.display" from https://***.display/***?key=*** with "api_key:***"`,
+			name:         "quoted parameter and a field-shaped URL host",
+			input:        `Invalid parameter "request.thinking.display" from https://user:password@request.thinking.display/private?key=review-token with "api_key:review-secret"`,
+			want:         `Invalid parameter "request.thinking.display" from https://***.display/***?key=*** with "api_key:***"`,
+			upstreamURLs: []string{"https://request.thinking.display"},
 		},
 		{
-			name:  "structured parameter label does not exempt a host value",
-			input: `{"param":"body.thinking.adaptive.display","host":"body.thinking.adaptive.display","message":"api_key:review-secret"}`,
-			want:  `{"param":"body.thinking.adaptive.display","host":"***.***.***.display","message":"api_key:***"}`,
+			name:         "structured parameter label does not exempt a host value",
+			input:        `{"param":"body.thinking.adaptive.display","host":"body.thinking.adaptive.display","message":"api_key:review-secret"}`,
+			want:         `{"param":"body.thinking.adaptive.display","host":"***.***.***.display","message":"api_key:***"}`,
+			upstreamURLs: []string{"https://body.thinking.adaptive.display"},
 		},
 		{
-			name:  "field-shaped URL path and larger hostname remain masked",
-			input: "thinking.display: Input should be 'omitted'; field thinking.display/private; private.request.thinking.display: Input should be valid; ftp://thinking.display: Input should be valid",
-			want:  "thinking.display: Input should be 'omitted'; field ***.display/private; ***.***.***.display: Input should be valid; ftp://***.display: Input should be valid",
+			name:         "field-shaped URL path and larger hostname remain masked",
+			input:        "thinking.display: Input should be 'omitted'; field thinking.display/private; private.request.thinking.display: Input should be valid; ftp://thinking.display: Input should be valid",
+			want:         "thinking.display: Input should be 'omitted'; field ***.display/private; ***.***.***.display: Input should be valid; ftp://***.display: Input should be valid",
+			upstreamURLs: []string{"https://thinking.display", "https://private.request.thinking.display"},
 		},
 		{
-			name:  "field label does not exempt host ports queries or API key values",
-			input: "parameter thinking.display:443; field thinking.display?token=value; api_key:request.thinking.display",
-			want:  "parameter ***.display:443; field ***.display?token=value; api_key:***",
+			name:         "field label does not exempt host ports queries or API key values",
+			input:        "parameter thinking.display:443; field thinking.display?token=value; api_key:request.thinking.display",
+			want:         "parameter ***.display:443; field ***.display?token=value; api_key:***",
+			upstreamURLs: []string{"https://thinking.display"},
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			assert.Equal(t, test.want, common.MaskSensitiveInfo(test.input))
+			assert.Equal(t, test.want, common.MaskSensitiveInfo(test.input, test.upstreamURLs...))
+		})
+	}
+}
+
+// Only addresses the admin configured are masked: a channel on the base URL
+// new-api presets reaches a public official endpoint, and so do adaptors that
+// build official endpoints themselves.
+func TestUpstreamAddressesMaskOnlyConfiguredAddresses(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		channelType int
+		baseURL     string
+		origin      string
+		proxyEnv    string
+		message     string
+		want        string
+	}{
+		{
+			name:        "preset base URL stays readable",
+			channelType: constant.ChannelTypeAnthropic,
+			baseURL:     "https://api.anthropic.com",
+			origin:      "https://api.anthropic.com",
+			message:     "request to https://api.anthropic.com/v1/messages failed, see https://platform.claude.com/docs/en/build-with-claude/task-budgets",
+			want:        "request to https://api.anthropic.com/v1/messages failed, see https://platform.claude.com/docs/en/build-with-claude/task-budgets",
+		},
+		{
+			name:        "official endpoint built by the adaptor stays readable",
+			channelType: constant.ChannelTypeVertexAi,
+			origin:      "https://us-central1-aiplatform.googleapis.com",
+			message:     "request to https://us-central1-aiplatform.googleapis.com/v1/projects failed",
+			want:        "request to https://us-central1-aiplatform.googleapis.com/v1/projects failed",
+		},
+		{
+			name:        "configured base URL is masked",
+			channelType: constant.ChannelTypeOpenAI,
+			baseURL:     "https://relay.private.example",
+			origin:      "https://relay.private.example",
+			message:     "request to https://relay.private.example/v1/chat/completions failed",
+			want:        "request to https://***.example/***/***/*** failed",
+		},
+		{
+			name:        "absolute Advanced Custom route is masked",
+			channelType: constant.ChannelTypeAdvancedCustom,
+			origin:      "https://route.private.example",
+			message:     "dial tcp: lookup route.private.example: no such host",
+			want:        "dial tcp: lookup ***.***.example: no such host",
+		},
+		{
+			name:        "environment proxy is masked on a preset channel",
+			channelType: constant.ChannelTypeAnthropic,
+			baseURL:     "https://api.anthropic.com",
+			proxyEnv:    "http://egress.private.invalid:8080",
+			message:     "proxyconnect tcp: dial tcp: lookup egress.private.invalid: no such host",
+			want:        "proxyconnect tcp: dial tcp: lookup ***.***.invalid: no such host",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("HTTPS_PROXY", tc.proxyEnv)
+			t.Setenv("HTTP_PROXY", "")
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			common.SetContextKey(c, constant.ContextKeyChannelType, tc.channelType)
+			common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, tc.baseURL)
+			common.SetContextKey(c, constant.ContextKeyUpstreamRequestOrigin, tc.origin)
+			apiErr := types.NewErrorWithStatusCode(errors.New(tc.message), types.ErrorCodeBadResponseStatusCode, http.StatusBadGateway)
+
+			assert.Equal(t, tc.want, apiErr.ToOpenAIError(common.UpstreamAddresses(c)...).Message)
 		})
 	}
 }

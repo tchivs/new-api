@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/relay/channel/advancedcustom"
 	"github.com/QuantumNous/new-api/relay/channel/claude"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
@@ -114,7 +116,7 @@ func TestClaudeStreamRetryAndErrorPresentation(t *testing.T) {
 	const start = `data: {"type":"message_start","message":{"id":"msg_retry","type":"message","role":"assistant","model":"claude-opus-5","content":[],"usage":{"input_tokens":5,"output_tokens":0}}}` + "\n\n"
 	const text = `data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial output"}}` + "\n\n"
 	const tool = `data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_1","name":"lookup","input":{}}}` + "\n\n"
-	const providerError = `data: {"type":"error","error":{"type":"overloaded_error","message":"upstream overloaded"}}` + "\n\n"
+	const providerError = `data: {"type":"error","error":{"type":"overloaded_error","message":"upstream overloaded: https://private.upstream.example/retry?token=stream-secret"}}` + "\n\n"
 
 	for _, test := range []struct {
 		name     string
@@ -136,6 +138,7 @@ func TestClaudeStreamRetryAndErrorPresentation(t *testing.T) {
 			recorder := httptest.NewRecorder()
 			c, _ := gin.CreateTestContext(recorder)
 			c.Request = httptest.NewRequest(http.MethodPost, "/", nil)
+			common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, "https://private.upstream.example")
 			if test.ping {
 				helper.SetEventStreamHeaders(c)
 				require.NoError(t, helper.PingData(c))
@@ -178,6 +181,8 @@ func TestClaudeStreamRetryAndErrorPresentation(t *testing.T) {
 			}
 
 			body := recorder.Body.String()
+			assert.NotContains(t, body, "private.upstream.example")
+			assert.NotContains(t, body, "stream-secret")
 			if committed {
 				assert.Contains(t, body, test.wantData)
 			}
@@ -198,7 +203,7 @@ func TestClaudeStreamRetryAndErrorPresentation(t *testing.T) {
 					Error types.OpenAIError `json:"error"`
 				}
 				require.NoError(t, common.UnmarshalJsonStr(lastData, &terminal))
-				assert.Equal(t, "upstream overloaded", terminal.Error.Message)
+				assert.Equal(t, "upstream overloaded: https://***.example/***?token=***", terminal.Error.Message)
 				assert.Equal(t, "overloaded_error", terminal.Error.Type)
 				if test.format == types.RelayFormatClaude {
 					assert.Equal(t, "error", terminal.Type)
@@ -335,4 +340,72 @@ func TestResponsesStreamRelayErrorPresentation(t *testing.T) {
 	assert.Equal(t, "upstream unavailable", event["message"])
 	assert.NotContains(t, event, "error", "Responses errors use flat error event fields")
 	assert.NotContains(t, body, "[DONE]")
+}
+
+func TestRelayErrorPresentationMasksConfiguredUpstreamAcrossFormats(t *testing.T) {
+	for _, format := range []types.RelayFormat{types.RelayFormatOpenAI, types.RelayFormatClaude, types.RelayFormatOpenAIResponses} {
+		for _, stream := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%v/stream=%t", format, stream), func(t *testing.T) {
+				recorder := httptest.NewRecorder()
+				c, _ := gin.CreateTestContext(recorder)
+				c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+				common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, "https://private.upstream.example")
+				if stream {
+					c.Header("Content-Type", "text/event-stream")
+					_, err := c.Writer.Write([]byte(": keepalive\n\n"))
+					require.NoError(t, err)
+				}
+				apiErr := types.NewOpenAIError(errors.New("request.thinking.display: Input should be 'omitted'; upstream https://private.upstream.example/tenant?token=fixture-secret; see https://docs.example.org/errors"), types.ErrorCodeBadResponseBody, http.StatusBadGateway)
+
+				respondRelayError(c, format, nil, apiErr)
+
+				body := recorder.Body.String()
+				assert.Contains(t, body, "request.thinking.display")
+				assert.Contains(t, body, "https://***.example/***?token=***")
+				assert.Contains(t, body, "https://docs.example.org/errors")
+				assert.NotContains(t, body, "private.upstream.example")
+				assert.NotContains(t, body, "fixture-secret")
+				if stream {
+					assert.Equal(t, http.StatusOK, recorder.Code)
+					assert.Contains(t, recorder.Header().Get("Content-Type"), "text/event-stream")
+				} else {
+					assert.Equal(t, http.StatusBadGateway, recorder.Code)
+					assert.Contains(t, recorder.Header().Get("Content-Type"), "application/json")
+				}
+			})
+		}
+	}
+}
+
+func TestAdvancedCustomURLBuildErrorMasksConfiguredAddress(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	common.SetContextKey(c, constant.ContextKeyChannelType, constant.ChannelTypeAdvancedCustom)
+	common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, "https://api.openai.com")
+	info := &relaycommon.RelayInfo{
+		RelayFormat:     types.RelayFormatOpenAI,
+		RequestURLPath:  "/v1/chat/completions",
+		OriginModelName: "fixture-model",
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelType:       constant.ChannelTypeAdvancedCustom,
+			ChannelBaseUrl:    "https://api.openai.com",
+			UpstreamModelName: "%",
+			ChannelOtherSettings: dto.ChannelOtherSettings{
+				AdvancedCustom: &dto.AdvancedCustomConfig{
+					Routes: []dto.AdvancedCustomRoute{{IncomingPath: "/v1/chat/completions", UpstreamPath: "https://private.route.example/v1/{model}?token=build-secret", Converter: "none"}},
+				},
+			},
+		},
+	}
+
+	_, err := (&advancedcustom.Adaptor{}).DoRequest(c, info, strings.NewReader("{}"))
+
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "private.route.example")
+	assert.Empty(t, common.GetContextKeyString(c, constant.ContextKeyUpstreamRequestOrigin))
+	apiErr := types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusBadGateway)
+	respondRelayError(c, types.RelayFormatOpenAI, nil, apiErr)
+	assert.NotContains(t, recorder.Body.String(), "private.route.example")
+	assert.NotContains(t, recorder.Body.String(), "build-secret")
 }

@@ -215,8 +215,9 @@ func respondRelayError(c *gin.Context, relayFormat types.RelayFormat, ws *websoc
 		c.Request != nil && c.Request.Context().Err() != nil {
 		return
 	}
+	upstreamURLs := common.UpstreamAddresses(c)
 	if relayFormat == types.RelayFormatOpenAIRealtime {
-		helper.WssError(c, ws, apiErr.ToOpenAIError())
+		helper.WssError(c, ws, apiErr.ToOpenAIError(upstreamURLs...))
 		return
 	}
 
@@ -227,9 +228,9 @@ func respondRelayError(c *gin.Context, relayFormat types.RelayFormat, ws *websoc
 		var writeErr error
 		switch relayFormat {
 		case types.RelayFormatClaude:
-			writeErr = helper.ClaudeData(c, dto.ClaudeResponse{Type: "error", Error: apiErr.ToClaudeError()})
+			writeErr = helper.ClaudeData(c, dto.ClaudeResponse{Type: "error", Error: apiErr.ToClaudeError(upstreamURLs...)})
 		case types.RelayFormatOpenAIResponses, types.RelayFormatOpenAIResponsesCompaction:
-			openaiErr := apiErr.ToOpenAIError()
+			openaiErr := apiErr.ToOpenAIError(upstreamURLs...)
 			response := dto.ResponsesStreamResponse{
 				Type: "error", Code: string(apiErr.GetErrorCode()), Message: openaiErr.Message, Param: openaiErr.Param,
 			}
@@ -239,7 +240,7 @@ func respondRelayError(c *gin.Context, relayFormat types.RelayFormat, ws *websoc
 				writeErr = helper.ResponseChunkData(c, response, string(data))
 			}
 		default:
-			writeErr = helper.ObjectData(c, gin.H{"error": apiErr.ToOpenAIError()})
+			writeErr = helper.ObjectData(c, gin.H{"error": apiErr.ToOpenAIError(upstreamURLs...)})
 		}
 		if writeErr != nil {
 			logger.LogError(c, "send relay stream error failed: "+writeErr.Error())
@@ -250,9 +251,9 @@ func respondRelayError(c *gin.Context, relayFormat types.RelayFormat, ws *websoc
 	// Merely preparing SSE headers does not commit a response body or status.
 	c.Header("Content-Type", "application/json; charset=utf-8")
 	if relayFormat == types.RelayFormatClaude {
-		c.JSON(apiErr.StatusCode, gin.H{"type": "error", "error": apiErr.ToClaudeError()})
+		c.JSON(apiErr.StatusCode, gin.H{"type": "error", "error": apiErr.ToClaudeError(upstreamURLs...)})
 	} else {
-		c.JSON(apiErr.StatusCode, gin.H{"error": apiErr.ToOpenAIError()})
+		c.JSON(apiErr.StatusCode, gin.H{"error": apiErr.ToOpenAIError(upstreamURLs...)})
 	}
 }
 
